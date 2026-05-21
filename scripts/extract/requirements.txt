@@ -1,0 +1,11 @@
+# PDF extraction backends for the RAG pipeline. extract.py uses the best one
+# that is installed, in this order: docling > pymupdf4llm > pypdf.
+#
+# Recommended minimum (lightweight, pip-only, no ML — page-tagged Markdown
+# with basic tables):
+pymupdf4llm>=0.0.17
+pypdf>=4.2.0
+
+# Best quality (layout + table-structure model; multi-GB, pulls torch).
+# Uncomment to enable — extract.py picks it up automatically once installed:
+# docling>=2.0.0

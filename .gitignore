@@ -1,0 +1,26 @@
+# Secrets
+.env
+.env.local
+*.env
+
+# Dependencies
+node_modules/
+**/node_modules/
+
+# Python venvs / caches
+**/.venv/
+**/__pycache__/
+*.pyc
+
+# RAG corpus + derived state (PDFs are copyright-restricted; DB is local state)
+data/*/
+!data/*/.gitkeep
+storage/
+
+# Editor / OS
+.vscode/*
+!.vscode/mcp.json
+!.vscode/settings.json
+.DS_Store
+Thumbs.db
+*.swp

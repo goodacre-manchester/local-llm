@@ -1,0 +1,18 @@
+{
+  "name": "local-llm-rag-server",
+  "version": "1.0.0",
+  "description": "Local PDF RAG service with Ollama + Chroma",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "morgan": "^1.10.0",
+    "pdf-parse": "^1.1.1"
+  }
+}
+

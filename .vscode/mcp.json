@@ -1,0 +1,12 @@
+{
+  "servers": {
+    "local-rag": {
+      "type": "stdio",
+      "command": "node",
+      "args": ["${workspaceFolder}/scripts/rag-mcp/index.js"],
+      "env": {
+        "RAG_BASE_URL": "http://127.0.0.1:3000"
+      }
+    }
+  }
+}

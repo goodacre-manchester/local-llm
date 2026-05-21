@@ -1,0 +1,10 @@
+{
+  "name": "rag-mcp",
+  "version": "1.0.0",
+  "description": "MCP server exposing the local RAG server as Copilot tools",
+  "type": "module",
+  "main": "index.js",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.0"
+  }
+}

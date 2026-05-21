@@ -1,0 +1,4 @@
+{
+  // Ollama models are added via the Copilot Chat model picker UI — no setting needed.
+  // See README.md § "VS Code Copilot — Local Ollama models" for setup steps.
+}

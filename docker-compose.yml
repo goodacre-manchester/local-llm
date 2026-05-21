@@ -1,0 +1,127 @@
+services:
+  chroma:
+    image: chromadb/chroma:0.5.5
+    container_name: local-llm-chroma
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./storage/chroma:/chroma/chroma
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request,sys; urllib.request.urlopen('http://127.0.0.1:8000/api/v1/heartbeat', timeout=5); sys.exit(0)"
+        ]
+      interval: 15s
+      timeout: 8s
+      retries: 8
+      start_period: 20s
+
+  rag-server:
+    image: node:20-slim
+    container_name: local-llm-rag-server
+    restart: unless-stopped
+    working_dir: /app
+    network_mode: host
+    volumes:
+      - ./app:/app
+      - ./data:/data:ro
+    environment:
+      - PORT=3000
+      - OLLAMA_HOST=http://127.0.0.1:11434
+      - CHROMA_URL=http://127.0.0.1:8000
+      - DATA_DIR=/data
+      - EMBEDDING_MODEL=nomic-embed-text
+      # Fast default + opt-in deep (request "<collection>!deep"). See §5.3.
+      - CHAT_MODEL=gemma4:e4b
+      - CHAT_MODEL_DEEP=qwen2.5-coder:32b-instruct-q4_K_M
+      - CHUNK_SIZE=1000
+      - CHUNK_OVERLAP=200
+      - CHUNK_CLAUSE_DEPTH=3
+      - TOP_K_RESULTS=8
+      - CHAT_NUM_CTX=12288
+      - CHAT_NUM_CTX_DEEP=12288
+      - TOP_K_DEEP=15
+      - RAG_GROUNDING=augmented
+      # Multi-query expansion (fixes recall on contrastive questions). Uses
+      # the fast model for decomposition by default.
+      - QUERY_EXPANSION=true
+      - MAX_SUBQUERIES=5
+      - AUTO_INGEST=true
+      # Cross-encoder reranker (sidecar below). RAG degrades to fused order
+      # if it is down/slow, so no depends_on is needed.
+      - RERANKER_URL=http://127.0.0.1:8008/rerank
+    command: >
+      sh -lc "npm install && node server.js"
+    depends_on:
+      chroma:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:3000/health').then((r)=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+        ]
+      interval: 20s
+      timeout: 8s
+      retries: 15
+      # First boot runs `npm install` then AUTO_INGEST embeds every PDF in
+      # every collection; give that a wide grace window before failures count
+      # so open-webui (depends_on: rag-server healthy) isn't blocked by a
+      # transient early-unhealthy state.
+      start_period: 180s
+
+  reranker:
+    image: python:3.12-slim
+    container_name: local-llm-reranker
+    restart: unless-stopped
+    working_dir: /app
+    network_mode: host
+    volumes:
+      - ./scripts/reranker:/app
+      # Persisted venv + HuggingFace model cache so torch/the reranker model
+      # download only once (survives container recreate).
+      - ./storage/reranker:/cache
+    environment:
+      - PORT=8008
+      - RERANKER_MODEL=BAAI/bge-reranker-base
+      - HF_HOME=/cache/hf
+    command: >
+      sh -lc "python -m venv /cache/venv 2>/dev/null || true;
+              . /cache/venv/bin/activate;
+              pip install -q --upgrade pip;
+              pip install -q -r requirements.txt;
+              exec python server.py"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request,sys; urllib.request.urlopen('http://127.0.0.1:8008/health', timeout=5); sys.exit(0)"
+        ]
+      interval: 20s
+      timeout: 8s
+      retries: 30
+      # First boot pip-installs torch + downloads the reranker model.
+      start_period: 600s
+
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:main
+    container_name: local-llm-open-webui
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      - OLLAMA_BASE_URL=http://127.0.0.1:11434
+      - WEBUI_AUTH=true
+      - PORT=8080
+    volumes:
+      - ./storage/open-webui:/app/backend/data
+    depends_on:
+      rag-server:
+        condition: service_healthy

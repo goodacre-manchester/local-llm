@@ -13,7 +13,13 @@ This implementation uses a hybrid Windows + WSL model:
 - Docker in WSL runs:
   - `chroma` vector database on port `8000` (published `8000:8000`).
   - `rag-server` (Node.js) on port `3000` (`network_mode: host`).
+  - `reranker` (Python) on port `8008` (`network_mode: host`, CPU-only).
   - `open-webui` browser chat interface on port `8080` (`network_mode: host`).
+  - `sd-webui` Automatic1111 Stable Diffusion WebUI on port `7860` (port-mapped
+    `7860:7860`, GPU reservation) — image-generation backend that Open WebUI
+    dispatches to from the per-message **image** button. Runtime spec: §4
+    item 5; provisioning: §6.5 + §7.2; ops + VRAM coexistence: §12.1;
+    new-machine quick-start: §13.1.
 - Ollama runs in WSL on port `11434`.
 
 Data flow:
@@ -26,6 +32,12 @@ Data flow:
 4. Query requests embed the question and return the top-k matched chunks; the
    OpenAI-compatible endpoint additionally feeds them to `CHAT_MODEL` for a
    synthesised answer.
+5. **Image-generation (orthogonal to RAG):** an assistant reply in Open WebUI
+   may be turned into a text→image dispatch by the user clicking the per-message
+   **image** button. Open WebUI POSTs the reply text as a prompt to
+   `sd-webui`'s `/sdapi/v1/txt2img`; the rendered PNG is inlined into the
+   conversation. The LLM emits ordinary text — there is no "create image"
+   protocol on the model side and no change to RAG/grounding logic.
 
 ## 2. Verified Host Baseline (This Machine)
 
@@ -64,6 +76,14 @@ Implemented files and folders:
 - `.vscode/mcp.json` — registers the MCP server for the editor
 - `.env.example` — documents the variables `server.js` reads
 - `scripts/bootstrap-models.sh`
+- `scripts/download-sd-models.sh`, `scripts/download-sd-models.ps1` — fetches
+  the default SDXL checkpoint (Juggernaut XL v9) into the `sd-webui` models
+  directory. Idempotent (size-checked).
+- `scripts/sd-webui-entrypoint.sh` — entrypoint wrapper for the `sd-webui`
+  container. Pip-upgrades the bundled torch to a Blackwell-capable
+  `cu128` wheel before A1111 starts (idempotent — skips if already
+  current); then `exec`s ai-dock's normal `init.sh`. Full rationale in
+  §6.5.2.
 - `scripts/ensure-services.sh` (WSL start + health-wait logic)
 - `scripts/start-local-llm.ps1` (Windows start entry point)
 - `scripts/stop-local-llm.ps1`
@@ -77,6 +97,13 @@ Implemented files and folders:
 - `storage/chroma/` (persistent vector store)
 - `storage/open-webui/` (persistent Open WebUI data)
 - `storage/reranker/` (persisted reranker venv + HF model cache)
+- `storage/sd-webui/` (ai-dock workspace; persists A1111 checkpoints, LoRAs,
+  VAEs, outputs across container recreate. Standard layout:
+  `storage/sd-webui/storage/stable_diffusion/models/{ckpt,lora,vae}/` +
+  `.../output/`. Heavy: a single SDXL checkpoint is ~6.6 GB.) Also contains
+  `storage/sd-webui/pip-cache/` — host-mounted pip wheel cache so the
+  cu128 torch reinstall on container recreate stays fast (~2.5 GB after
+  first boot; see §6.5.2).
 
 ## 4. Runtime Services
 
@@ -114,9 +141,62 @@ Implemented files and folders:
    - Port: `8080`
    - Ollama upstream: `http://127.0.0.1:11434`
    - Persistence: `./storage/open-webui:/app/backend/data`
-   - Depends on: `rag-server` healthy
+   - Depends on: `rag-server` healthy (does **not** wait on `sd-webui` — its
+     first boot is 10+ minutes and would needlessly delay the chat UI).
+   - Image-generation env (pre-pointed at `sd-webui` so no first-run admin
+     clicks are required):
+     - `ENABLE_IMAGE_GENERATION=true`
+     - `IMAGE_GENERATION_ENGINE=automatic1111`
+     - `AUTOMATIC1111_BASE_URL=http://127.0.0.1:7860`
+     - `IMAGE_GENERATION_MODEL=Juggernaut-XL_v9_RunDiffusionPhoto_v2`
+     - `IMAGE_SIZE=1024x1024`
+     - `IMAGE_STEPS=30`
    - No healthcheck is defined in compose; readiness is verified by
      `scripts/ensure-services.sh` polling `http://127.0.0.1:8080/health`.
+
+5. `sd-webui`
+   - Image: `ghcr.io/ai-dock/stable-diffusion-webui:latest-cuda` (chosen for
+     active maintenance + explicit `WEBUI_ARGS` env contract). Pinning to a
+     dated tag is recommended for reproducibility but not done by default to
+     keep the entry minimal.
+   - **Entrypoint override:** `/usr/local/bin/sd-webui-entrypoint.sh` (host
+     file [scripts/sd-webui-entrypoint.sh](scripts/sd-webui-entrypoint.sh),
+     bind-mounted in). Pip-upgrades the A1111 venv's torch to a Blackwell-
+     capable cu128 wheel before A1111 starts; see §6.5.2 for the why.
+     Idempotent; skips when already current.
+   - Network: **port-mapped** `7860:7860` (not `network_mode: host`) because
+     the ai-dock entrypoint expects to manage its own bind interface; the
+     port map plus its internal `--listen` gives the same external surface.
+     Open WebUI (host network) reaches it at `127.0.0.1:7860`.
+   - Launch args via env: `WEBUI_ARGS=--api --listen --cors-allow-origins=* --no-half-vae`
+     - `--api` exposes `/sdapi/v1/*` (the surface Open WebUI calls).
+     - `--listen` binds `0.0.0.0` inside the container so the port map works.
+     - `--cors-allow-origins=*` lets the Open WebUI browser tab POST cross-
+       origin to `:7860`.
+     - `--no-half-vae` avoids the occasional black-image SDXL+VAE precision
+       bug; harmless on a 16 GB card.
+   - `WEB_ENABLE_AUTH=false` — disable the ai-dock built-in basic auth; the
+     stack is local-only and Open WebUI gates LAN access on `:8080`.
+   - `AUTO_UPDATE=false` — do not silently `git pull` A1111 on every boot;
+     keeps the runtime reproducible.
+   - Optional env passthrough: `HF_TOKEN`, `CIVITAI_TOKEN` (blank = anonymous
+     downloads only; needed only for gated models like FLUX-dev).
+   - Volume: `./storage/sd-webui:/workspace` — ai-dock's workspace
+     convention. Checkpoints live at
+     `storage/sd-webui/storage/stable_diffusion/models/ckpt/` on the host →
+     `/workspace/storage/stable_diffusion/models/ckpt/` in the container.
+     A1111 picks them up on boot; **Settings → Reload UI** (or `docker
+     compose restart sd-webui`) forces a re-scan without full restart.
+   - GPU: `deploy.resources.reservations.devices` with `driver: nvidia,
+     count: all, capabilities: [gpu]`. This is the **first** GPU-using
+     container in the stack — the other services (Chroma, rag-server, Open
+     WebUI) are CPU-only; reranker is CPU-only by design. Requires NVIDIA
+     Container Toolkit in the Docker daemon (§6.5).
+   - Healthcheck: `GET /sdapi/v1/options` (cheapest live endpoint), interval
+     `30s`, **`start_period: 900s`** (15 min) because first boot clones the
+     A1111 source, installs PyTorch + xformers, and fetches dependencies —
+     easily 10 minutes on a fresh host. Subsequent boots are ~30 s.
+   - No `depends_on` to/from any other service (orthogonal to RAG).
 
 All containers use `restart: unless-stopped` so Docker restarts them after a
 crash or daemon restart. Startup ordering is enforced through
@@ -400,7 +480,81 @@ The lightweight backend (`pymupdf4llm`, `pypdf`) installs into that venv
 automatically on first run. Optionally `pip install docling` into
 `scripts/extract/.venv` for best-quality table/layout extraction.
 
-### 6.5 Install MCP server dependencies
+### 6.5 GPU plumbing for the sd-webui container
+
+#### 6.5.1 NVIDIA Container Toolkit (GPU into Docker)
+
+The `sd-webui` container requests a GPU via
+`deploy.resources.reservations.devices: nvidia`. For this to resolve, the
+Docker daemon needs the **NVIDIA Container Toolkit** runtime registered. On
+Docker Desktop (Windows + WSL2) this is bundled and on by default for recent
+versions; on a hand-installed `docker-ce` in WSL it must be added once.
+
+Verify GPU is visible inside a container:
+
+```powershell
+wsl -e bash -lc "sudo docker run --rm --gpus all nvidia/cuda:12.4.1-base-ubuntu22.04 nvidia-smi"
+```
+
+Expected: an `nvidia-smi` table identical to the host one. If you get
+`could not select device driver "" with capabilities: [[gpu]]`, install the
+toolkit in WSL Ubuntu:
+
+```powershell
+wsl -e bash -lc "curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg"
+wsl -e bash -lc "curl -fsSL https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' | sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list"
+wsl -e bash -lc "sudo apt-get update && sudo apt-get install -y nvidia-container-toolkit"
+wsl -e bash -lc "sudo nvidia-ctk runtime configure --runtime=docker && sudo service docker restart"
+```
+
+Re-run the verification command. If still failing, also confirm the WSL
+distro has GPU passthrough working (§6.1) and that
+`/usr/lib/wsl/lib/libcuda.so.1` exists (it should be auto-mounted by WSL).
+
+#### 6.5.2 PyTorch ↔ GPU compute-capability matrix (Blackwell workaround)
+
+A working NVIDIA runtime in Docker is necessary but not sufficient: the
+image's PyTorch must have prebuilt CUDA kernels for your GPU's compute
+capability (`sm_xy`). The ai-dock `:latest-cuda` tag ships
+**torch 2.4.0+cu121** whose kernels stop at `sm_90` — fine for Ampere
+(`sm_86`) and Hopper (`sm_90`), but **breaks at generate time on Blackwell**
+(`sm_100`/`sm_120`, RTX 50-series) with:
+
+```
+RuntimeError: CUDA error: no kernel image is available for execution on the device
+```
+
+Evidence captured on RTX 5070 Ti (2026-05-21):
+
+| Wheel | Includes sm_120? | Verdict |
+|---|---|---|
+| `torch 2.4.0+cu121` (ai-dock default) | no — archs `[sm_50..sm_90]` | fails |
+| `torch 2.7.1+cu126` | no — same arch list | fails |
+| `torch 2.11.0+cu128` | **yes** — `[sm_75..sm_90, sm_100, sm_120]` | works |
+
+(PyTorch shipped Blackwell kernels in the **cu128** wheels specifically, not
+cu126.) The workaround lives in
+[scripts/sd-webui-entrypoint.sh](scripts/sd-webui-entrypoint.sh) — a thin
+entrypoint wrapper that pip-upgrades to `torch 2.11.0+cu128` into the A1111
+venv on every container CREATION, then hands off to ai-dock's normal
+`init.sh`. The wrapper is mounted read-only at
+`/usr/local/bin/sd-webui-entrypoint.sh` and wired in via `entrypoint:` in
+docker-compose.yml. It is idempotent (skips when already on cu128), and a
+host-mounted pip cache
+(`./storage/sd-webui/pip-cache:/root/.cache/pip`) makes repeat installs
+near-instant.
+
+xformers ships compiled against the original `torch 2.4.0+cu121` and is ABI-
+incompatible with the upgraded wheel; we disable it implicitly by adding
+`--opt-sdp-attention` to `WEBUI_ARGS`, which uses PyTorch's native
+scaled-dot-product attention (comparable speed on modern PyTorch).
+
+**Removal criterion:** when ai-dock publishes a `:latest-cuda-12.8+` (or
+later) tag whose bundled PyTorch already includes Blackwell kernels, switch
+the image tag in docker-compose.yml and delete this wrapper. The wrapper is
+a stopgap, not a permanent design.
+
+### 6.6 Install MCP server dependencies
 
 The editor MCP integration (`.vscode/mcp.json`) runs
 `node scripts/rag-mcp/index.js`, which needs its npm dependencies installed:
@@ -415,6 +569,8 @@ own dependencies install automatically — the `rag-server` container runs
 
 ## 7. Model Provisioning
 
+### 7.1 Ollama models (LLM + embeddings)
+
 From repository root:
 
 ```powershell
@@ -426,7 +582,38 @@ This script pulls:
 - `llama3.1:8b-instruct-q8_0`
 - `qwen2.5-coder:32b-instruct-q4_K_M`
 - `deepseek-r1:14b`
+- `gemma4:e4b`, `gemma4:26b`
 - `nomic-embed-text`
+
+### 7.2 Stable Diffusion checkpoints (image generation)
+
+The `sd-webui` container starts empty — A1111 will boot and show **no models
+available** until at least one `.safetensors` is dropped into
+`storage/sd-webui/storage/stable_diffusion/models/ckpt/`. The provisioning
+script downloads the project default:
+
+```powershell
+.\scripts\download-sd-models.ps1
+```
+
+What it does:
+
+- Downloads `Juggernaut-XL_v9_RunDiffusionPhoto_v2.safetensors` (~6.6 GB)
+  from `https://huggingface.co/RunDiffusion/Juggernaut-XL-v9` (public,
+  no token required) into the mounted host path above.
+- Idempotent: skips if the file is already present at ≥6 GB; restarts the
+  download if a previous attempt left a smaller partial file.
+- Files placed under `storage/sd-webui/storage/stable_diffusion/models/`
+  appear inside the container without restart on the next A1111 model
+  rescan (**Settings → Reload UI** in the WebUI, or
+  `docker compose restart sd-webui`).
+
+Add more checkpoints by dropping any SDXL/SD1.5 `.safetensors` into the same
+folder. The choice of Juggernaut XL v9 as the default — over plain SDXL Base
+1.0, DreamShaper XL, or the Lightning variants — was a deliberate trade:
+best general-purpose quality at acceptable speed and VRAM cost on a 16 GB
+card co-resident with Ollama. Pivot to a **Lightning** variant if VRAM
+contention with `!deep` becomes a recurring problem (§12.1).
 
 ## 8. Autostart After Machine Reboot
 
@@ -447,12 +634,34 @@ runs `scripts/ensure-services.sh` in WSL. That script:
 
 1. Starts the Docker daemon in WSL if not already running.
 2. Starts the Ollama service in WSL if not already running.
-3. Runs `docker compose up -d` for all three containers.
-4. Waits for each health endpoint to become reachable.
+3. Runs `docker compose up -d` **with no service names** so every service in
+   `docker-compose.yml` is brought up (currently: `chroma`, `rag-server`,
+   `reranker`, `open-webui`, `sd-webui`). New services added to compose are
+   auto-included on the next boot without script edits.
+4. Waits for the **critical user path** health endpoints only:
+   `chroma /api/v1/heartbeat`, `rag-server /health`, `open-webui /health`.
+   The slow first-boot services start **in the background**, intentionally
+   un-waited:
+   - `reranker` — first boot installs torch + downloads `bge-reranker-base`
+     (~5 min). `rag-server` already falls back to fused order when it's not
+     ready, so blocking the user's chat access on it is unjustified.
+   - `sd-webui` — first boot clones A1111 + installs PyTorch/xformers
+     (~10–15 min on a fresh host). Blocking the chat UI on this would defeat
+     the autostart UX; the image-gen button in chat will surface a transient
+     error until first boot finishes, then work for all subsequent boots
+     (~30 s warm restart).
+   After the critical waits, the script does a **non-blocking probe** of
+   `:7860/sdapi/v1/options` and `:8008/health` and logs `ready` /
+   `still booting`, so the autostart log makes the image-gen state obvious.
 5. Holds the WSL session open (`exec sleep infinity`) so WSL — and therefore
    Docker — stays alive and reachable from Windows. The launcher process
    therefore stays resident by design; this also means running
    `start-local-llm.ps1` from an interactive terminal will not return.
+
+After first-boot completion, `restart: unless-stopped` on every container
+means subsequent WSL/Windows reboots resume all services (including
+`sd-webui`) automatically — the explicit `up -d` in step 3 is what guarantees
+they exist on the very first run after a fresh clone.
 
 An alternative Task Scheduler method is available via
 `scripts\register-autostart-task.ps1` but requires admin elevation, and the
@@ -474,6 +683,7 @@ Validate endpoints directly:
 wsl -e bash -lc "curl -fsS http://127.0.0.1:8000/api/v1/heartbeat"
 wsl -e bash -lc "curl -fsS http://127.0.0.1:3000/health"
 wsl -e bash -lc "curl -I http://127.0.0.1:8080"
+wsl -e bash -lc "curl -fsS http://127.0.0.1:7860/sdapi/v1/options >/dev/null && echo 'sd-webui: ok'"
 wsl -e bash -lc "sudo docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'"
 ```
 
@@ -482,7 +692,10 @@ Expected result:
 - Chroma heartbeat returns JSON.
 - RAG `/health` returns `{ "ok": true, ... }`.
 - Open WebUI responds on `http://localhost:8080`.
-- All three containers are `Up`.
+- `sd-webui` returns `ok` once first boot is complete (10+ min on a fresh
+  install; tail with `docker compose logs -f sd-webui` if still booting).
+- All five containers (`chroma`, `rag-server`, `reranker`, `open-webui`,
+  `sd-webui`) are `Up`.
 
 ## 10. Open WebUI First-Run Access
 
@@ -541,7 +754,202 @@ except `/health`.
   wsl -e bash -lc "ollama --version && curl -fsS http://127.0.0.1:11434/api/tags"
   ```
 
-### 12.1 LAN access to Open WebUI (WSL2 mirrored mode)
+### 12.1 Image generation (sd-webui) — full enable runbook
+
+This section is the end-to-end "make image generation actually work"
+reference. README's "Image generation (Automatic1111)" is the user-facing
+summary; this is the implementation-level detail.
+
+#### 12.1.1 The five things that must be in place
+
+If any of these is missing, image generation either fails or silently
+no-ops. They are ordered by where they live, not by user effort.
+
+| # | Layer | What | Configured by | Done once per |
+|---|---|---|---|---|
+| 1 | Host / Docker | NVIDIA Container Toolkit registered in the Docker daemon (so `deploy.resources.reservations.devices: nvidia` resolves) | §6.5.1 apt install + `nvidia-ctk runtime configure --runtime=docker` + `service docker restart` | Machine |
+| 2 | Host disk | At least one `.safetensors` checkpoint under `storage/sd-webui/storage/stable_diffusion/models/ckpt/` | `scripts/download-sd-models.ps1` (idempotent) | Once + per added model |
+| 3 | sd-webui container | A1111 running with the `--api` surface and a Blackwell-capable PyTorch in its venv | docker-compose.yml service + `scripts/sd-webui-entrypoint.sh` wrapper | Auto on every container creation |
+| 4 | Open WebUI backend | OW configured to talk to sd-webui (engine, base URL, default model, size, steps) | Pre-set via env vars on the `open-webui` service in docker-compose.yml; verifiable in Admin Panel → Settings → Images | Once (env-driven, survives recreate) |
+| 5 | Open WebUI chat trigger | An explicit per-chat trigger turned on (Integrations → Images, or per-message button, or LLM tool calling) | Per chat or one-time per-model admin config — see §12.1.5 | Per chat / per click |
+
+**The single most common "image gen isn't working" failure is missing #5.**
+The LLM emitting JSON or claiming to generate an image triggers nothing —
+Open WebUI does not parse reply content for image intent. The dispatch is
+strictly user-triggered or tool-call-triggered.
+
+#### 12.1.2 First-boot behaviour
+
+The ai-dock A1111 image is heavy on first start of a fresh container:
+
+- Initialises supervisord-managed services (caddy, jupyter, syncthing,
+  quicktunnel) — these are ai-dock baggage we don't actively use but they
+  start anyway. None contend for the GPU.
+- Clones the upstream AUTOMATIC1111/stable-diffusion-webui repo into
+  `/opt/stable-diffusion-webui` (cached in the container's writable layer).
+- Downloads a default SD 1.5 checkpoint
+  (`v1-5-pruned-emaonly.safetensors`, ~4 GB) into
+  `/opt/stable-diffusion-webui/models/Stable-diffusion/` — this happens
+  even though we've bind-mounted our own model dir on top, because
+  ai-dock's provisioning runs before our mounts apply during early init.
+  Persist it to the host with
+  `docker cp local-llm-sd-webui:/opt/stable-diffusion-webui/models/Stable-diffusion/v1-5-pruned-emaonly.safetensors storage/sd-webui/storage/stable_diffusion/models/ckpt/`
+  if you want it to survive recreates.
+- Runs `scripts/sd-webui-entrypoint.sh` (our wrapper) **before** A1111
+  starts, which pip-installs `torch 2.11.0+cu128` + `torchvision` into
+  `/opt/environments/python/webui/` for Blackwell support (~2.5 GB
+  download, cached in host volume `./storage/sd-webui/pip-cache` so repeat
+  recreates are near-instant). See §6.5.2 for why.
+- Starts A1111 with `--api --listen --cors-allow-origins=* --no-half-vae
+  --opt-sdp-attention` (see service spec in §4 item 5).
+
+Healthcheck `start_period: 900s` (15 min) covers the worst case. Subsequent
+boots of the same container are ~30 s.
+
+> **What survives `docker compose down` + `up -d`?**
+> - Host-mounted dirs survive unconditionally: checkpoints, LoRAs, VAEs,
+>   outputs, pip cache, `/workspace`.
+> - The container's writable layer (which holds the A1111 source clone and
+>   the ai-dock-auto-downloaded v1-5) is **destroyed by `down`** and
+>   recreated on the next `up`. First-boot install runs again — but the
+>   pip cache mount makes the torch reinstall fast.
+> - The entrypoint wrapper's torch upgrade also re-runs (idempotent; skips
+>   when already on a `cu128` build).
+>
+> So `down/up` costs roughly ~5 min on a warm host (A1111 git clone +
+> default v1-5 download), not the full 15 min of true first boot.
+
+#### 12.1.3 Open WebUI backend wiring
+
+docker-compose.yml sets these env vars on `open-webui` so first run is
+keystroke-free:
+
+```yaml
+- ENABLE_IMAGE_GENERATION=true
+- IMAGE_GENERATION_ENGINE=automatic1111
+- AUTOMATIC1111_BASE_URL=http://127.0.0.1:7860
+- IMAGE_GENERATION_MODEL=Juggernaut-XL_v9_RunDiffusionPhoto_v2
+- IMAGE_SIZE=1024x1024
+- IMAGE_STEPS=30
+```
+
+Verify in browser at Admin Panel → **Settings → Images** — the values above
+should be reflected. The **Model** dropdown is populated by a live
+`GET /sdapi/v1/sd-models` against sd-webui; an empty dropdown means
+sd-webui is unreachable, still booting, or has no `.safetensors` in the
+mounted ckpt dir.
+
+> **Env vs config precedence.** OW stores effective config in
+> `storage/open-webui/webui.db` (SQLite, `config` table). On startup, env
+> vars seed values that aren't already in the DB. Once a user explicitly
+> sets a value in the Admin panel, the DB wins and subsequent env changes
+> are ignored until either the DB is reset or the value is changed in the
+> UI. This means **changing the env vars after first launch may have no
+> visible effect** — go to the UI and confirm/correct directly.
+
+#### 12.1.4 Stray OpenAI connection cleanup (SSL handshake errors)
+
+A stray `https://127.0.0.1:3000/v1` entry in
+`config.openai.api_base_urls` causes Open WebUI to attempt an SSL handshake
+against the plain-HTTP rag-server on every model-list refresh, logging:
+
+```
+ERROR | open_webui.routers.openai:send_get_request:121 - Connection error:
+Cannot connect to host 127.0.0.1:3000 ssl:default [[SSL: WRONG_VERSION_NUMBER]
+```
+
+It's noisy but also masks legitimate connection failures. Fix in the UI
+(Settings → Connections, remove or correct the https entry) or directly in
+the DB:
+
+```bash
+sudo docker exec local-llm-open-webui python3 -c "
+import sqlite3, json
+db = sqlite3.connect('/app/backend/data/webui.db')
+row = db.execute('SELECT data FROM config WHERE id=1').fetchone()
+cfg = json.loads(row[0])
+old_urls = cfg.get('openai', {}).get('api_base_urls', [])
+old_keys = cfg.get('openai', {}).get('api_keys', [])
+# api_base_urls and api_keys are positionally aligned — drop the matching key too.
+keep = [i for i, u in enumerate(old_urls) if not u.startswith('https://127.0.0.1:3000')]
+cfg['openai']['api_base_urls'] = [old_urls[i] for i in keep]
+if len(old_keys) == len(old_urls):
+    cfg['openai']['api_keys'] = [old_keys[i] for i in keep]
+db.execute('UPDATE config SET data=? WHERE id=1', (json.dumps(cfg),))
+db.commit()
+print('cleaned:', cfg['openai']['api_base_urls'])
+" && sudo docker restart local-llm-open-webui
+```
+
+#### 12.1.5 Chat-side triggers (the three ways to actually get an image)
+
+Open WebUI does **not** parse the LLM's reply for image-generation intent.
+The dispatch must be triggered explicitly. Pick whichever matches user
+expectations.
+
+| Trigger | Mechanism | UX | When to pick |
+|---|---|---|---|
+| **Integrations → Images** | In the chat input, click the **Integrations** icon (puzzle-piece / **+** on older OW) → toggle **Images** on. Every assistant reply in that chat is then ALSO sent to sd-webui (auto-image-per-reply). | "Ask normally, get an image inline with each answer." | Closest match to "ask, get image" intent. Per-chat scope (re-toggle in new chats). Recommended default. |
+| **Per-message picture button** | Each assistant reply has a picture icon in its action row — clicking it sends just that reply's text to sd-webui. | One-off, on-demand. | When you only occasionally want an image and don't want auto-gen overhead. |
+| **Tool calling (Native FC)** | Admin Panel → Settings → Models → (gear at top right) → **Function Calling = Native**; then per-model toggle **Capabilities → Image Generation** on. LLM emits a `generate_image` tool call which OW catches and dispatches. | "Tell the model to generate an image, it decides when to call the tool." | Most "agentic". Reliability depends on the model's native function-calling quality (Gemma 4 and Llama 3.1 8B work; smaller models are inconsistent). Setup is per-model. |
+
+Each is a real, supported trigger; none of them route based on the LLM
+saying "I'll generate an image" or emitting DALL·E-shaped JSON.
+
+#### 12.1.6 End-to-end smoke test (bypasses Open WebUI)
+
+Useful when isolating "is the backend healthy?" from "is OW configured
+correctly?":
+
+```bash
+# Load default model + generate a 1024x1024 PNG to d:\tmp\sd-smoke-test.png
+wsl -e bash -lc "curl -fsS -X POST http://127.0.0.1:7860/sdapi/v1/options \
+  -H 'Content-Type: application/json' \
+  -d '{\"sd_model_checkpoint\":\"Juggernaut-XL_v9_RunDiffusionPhoto_v2\"}' --max-time 180 && \
+  curl -fsS -X POST http://127.0.0.1:7860/sdapi/v1/txt2img \
+  -H 'Content-Type: application/json' \
+  -d '{\"prompt\":\"a single ripe red apple on a wooden table, soft window light, photorealistic\",\"steps\":20,\"width\":1024,\"height\":1024,\"sampler_name\":\"Euler a\",\"cfg_scale\":6}' \
+  --max-time 300 -o /tmp/sd-smoke.json && \
+  python3 -c 'import json,base64; png=base64.b64decode(json.load(open(\"/tmp/sd-smoke.json\"))[\"images\"][0]); open(\"/mnt/d/tmp/sd-smoke-test.png\",\"wb\").write(png); print(\"OK:\",len(png),\"bytes\")'"
+```
+
+Returns `OK: <bytes>` and writes a PNG on success. On RTX 5070 Ti expect
+~6–7 s for the generation step itself; first-call model load adds ~30–60 s.
+
+#### 12.1.7 GPU coexistence with Ollama (16 GB card)
+
+The default config keeps both runtimes resident; CUDA juggles VRAM:
+
+| Loaded together | Approx VRAM | Status |
+|---|---|---|
+| `gemma4:e4b` (fast) + SDXL Juggernaut XL | ~10 GB / 16 | comfortable headroom |
+| `gemma4:e4b` + SDXL during a generation | ~13 GB / 16 | tight on activations, fine |
+| `qwen2.5-coder:32b` (`!deep`) + SDXL | exceeds 16 GB | OOM if concurrent |
+
+`!deep` already CPU-offloads on 16 GB; running an SDXL generation
+mid-`!deep` answer steals more VRAM and slows both. Practical pattern:
+image generation on top of fast-model replies; `!deep` for hard contrastive
+questions only; no concurrent use. Pivot to a **Lightning** variant of the
+checkpoint (4-step generation, ~3–5 s/image, ~6 GB VRAM peak) if
+contention becomes a recurring problem.
+
+#### 12.1.8 Operational commands
+
+```powershell
+# Tail sd-webui logs (incl. the [sd-webui-entrypoint] wrapper output)
+.\scripts\wsl-run.ps1 "sudo docker compose logs --tail=200 sd-webui"
+
+# List models currently visible to A1111
+wsl -e bash -lc "curl -fsS http://127.0.0.1:7860/sdapi/v1/sd-models | python3 -c 'import sys,json; [print(m[\"model_name\"]) for m in json.load(sys.stdin)]'"
+
+# Force A1111 to rescan models/ckpt/ after dropping a new .safetensors in
+wsl -e bash -lc "curl -fsS -X POST http://127.0.0.1:7860/sdapi/v1/refresh-checkpoints"
+
+# Inspect currently-active checkpoint
+wsl -e bash -lc "curl -fsS http://127.0.0.1:7860/sdapi/v1/options | python3 -c 'import sys,json; print(json.load(sys.stdin)[\"sd_model_checkpoint\"])'"
+```
+
+### 12.2 LAN access to Open WebUI (WSL2 mirrored mode)
 
 Open WebUI is localhost-only by default. Exposing it to other LAN devices
 under `networkingMode=mirrored` requires opening **two independent firewall
@@ -572,6 +980,11 @@ Gotchas:
 Full step-by-step (finding the LAN IP, profile/guest-SSID troubleshooting)
 is in README → "Access Open WebUI from other devices on your LAN".
 
+Note: `sd-webui` (port `7860`) is not LAN-exposed by default and shouldn't be
+— it's reached from Open WebUI's backend over the host loopback. The chat UI
+on `:8080` is the user-facing surface; the image-gen API on `:7860` stays
+local to the host.
+
 ## 13. Configuration for Other Machines
 
 Keep these invariant unless intentionally changed:
@@ -581,16 +994,86 @@ Keep these invariant unless intentionally changed:
    (coupled — see §4).
 3. Collection folder convention (`data/<name>`, `data/<name>/.rag-cache/`
    for extraction sidecars, `storage/chroma`).
-4. Default ports (`11434`, `8000`, `3000`, `8080`).
+4. Default ports (`11434`, `8000`, `3000`, `7860`, `8008`, `8080`).
 5. Open WebUI persistent storage path (`storage/open-webui`).
 6. Run `scripts\install-startup-launcher.ps1` on each new machine for logon
    autostart, and ensure passwordless sudo or `docker` group membership (§6.3).
 7. Run `npm install` in `scripts/rag-mcp` on each new machine for the MCP
-   integration (§6.5).
+   integration (§6.6).
 8. Run `scripts\extract-pdfs.ps1` after adding/changing PDFs so ingest gets
    table-aware chunks and page citations (the `.venv` and `.rag-cache/` are
    machine-local and rebuildable — safe to gitignore).
+9. **Image-gen prerequisites (new):** verify NVIDIA Container Toolkit is
+   installed (§6.5.1) and run `.\scripts\download-sd-models.ps1` once to
+   populate `storage/sd-webui/storage/stable_diffusion/models/ckpt/` with the
+   default Juggernaut XL v9 checkpoint. Without the model file, `sd-webui`
+   boots cleanly but Open WebUI's image button surfaces a `no model` error.
+10. **sd-webui persistent storage path** (`storage/sd-webui`). Contains the
+    checkpoints (`models/ckpt/` — ~6.6 GB+ per model), outputs, ai-dock
+    workspace, and the pip cache (`pip-cache/` — ~2.5 GB of cu128 wheels
+    after first boot). Heavy; exclude from any "small backup" set;
+    rebuildable by re-downloading the image, the model, and letting the
+    wrapper re-populate the pip cache.
+11. **Entrypoint wrapper for Blackwell GPUs** —
+    `scripts/sd-webui-entrypoint.sh` is host-mounted to
+    `/usr/local/bin/sd-webui-entrypoint.sh` and set as the container's
+    entrypoint (see §6.5.2). On non-Blackwell GPUs the wrapper still runs
+    safely (the cu128 wheel includes all earlier archs); the wrapper has no
+    operational cost beyond the one-time pip cache population. To skip the
+    wrapper on machines that already have a Blackwell-capable bundled image,
+    delete the `entrypoint:` line + the wrapper mount from docker-compose.yml.
+12. Pre-pointed Open WebUI image-gen env vars in `docker-compose.yml`
+    (`ENABLE_IMAGE_GENERATION`, `IMAGE_GENERATION_ENGINE`,
+    `AUTOMATIC1111_BASE_URL`, `IMAGE_GENERATION_MODEL`, `IMAGE_SIZE`,
+    `IMAGE_STEPS`) — these are what wire the **backend** out-of-the-box.
+    Changing them needs a container recreate (`docker compose up -d
+    open-webui`), not just a restart, and they only apply on first launch
+    when the OW config DB is empty — see §12.1.3.
+13. **Per-chat image trigger is NOT covered by env or autostart.** Open
+    WebUI does not auto-route LLM replies to image generation; the user
+    must explicitly enable a trigger per chat (Integrations → Images, the
+    recommended path) or accept the per-message picture-button workflow.
+    Tool calling is the third option but requires per-model Admin Panel
+    config (Function Calling = Native + Image Generation capability) — see
+    §12.1.5. This is the single most common "image gen isn't working"
+    failure mode for new installs.
 
 **Relocation:** The project is relocatable. All PowerShell scripts derive the
 repo path dynamically from `$PSScriptRoot` — no hardcoded paths. Clone the repo
 to any drive or directory and the scripts work without modification.
+
+### 13.1 New-machine quick-start (single sequence)
+
+The canonical fresh-clone bring-up, in order, end-to-end:
+
+```powershell
+# 1. WSL + Docker + Ollama + NVIDIA Container Toolkit (§6.1–§6.5)
+#    Verify with:
+wsl -e bash -lc "sudo docker run --rm --gpus all nvidia/cuda:12.4.1-base-ubuntu22.04 nvidia-smi"
+
+# 2. Pull Ollama models (§7.1)
+.\scripts\wsl-run.ps1 "chmod +x scripts/bootstrap-models.sh && ./scripts/bootstrap-models.sh"
+
+# 3. Download default SDXL checkpoint (§7.2, ~6.6 GB one-off)
+.\scripts\download-sd-models.ps1
+
+# 4. Install MCP server deps (§6.6)
+.\scripts\wsl-run.ps1 "cd scripts/rag-mcp && npm install"
+
+# 5. Install autostart launcher (§8)
+.\scripts\install-startup-launcher.ps1
+
+# 6. First start — brings up every compose service (5+ containers).
+#    chroma / rag-server / open-webui health-waited; reranker + sd-webui
+#    boot in background (10-15 min first time, ~30 s subsequent).
+.\scripts\start-local-llm.ps1
+
+# 7. Optional: drop PDFs into data/<collection>/, then
+.\scripts\extract-pdfs.ps1
+wsl -e bash -lc "curl -fsS -X POST http://127.0.0.1:3000/collections/<name>/ingest"
+```
+
+After this sequence, **every subsequent boot of the Windows host fully
+self-activates**: logon → Startup-folder launcher → ensure-services →
+`docker compose up -d` resurrects all containers via `restart: unless-stopped`
+→ chat + RAG + image generation all ready. No further intervention.

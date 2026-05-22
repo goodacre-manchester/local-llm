@@ -14,7 +14,11 @@ $pickDc = "if sudo -n true 2>/dev/null; then DC='sudo docker compose'; else DC='
 if ($service) {
     $wslCmd = "cd '$wslRepoRoot'; $pickDc; `$DC restart $service; `$DC ps"
 } else {
-    $wslCmd = "cd '$wslRepoRoot'; $pickDc; `$DC restart chroma rag-server open-webui; `$DC ps"
+    # Restart everything in compose. Includes reranker and sd-webui so they
+    # survive a manual restart (otherwise the prior `chroma rag-server open-webui`
+    # whitelist would leave them in their previous state — fine on subsequent
+    # boots but inconsistent with user intent of "restart all").
+    $wslCmd = "cd '$wslRepoRoot'; $pickDc; `$DC restart; `$DC ps"
 }
 
 & "C:\Windows\System32\wsl.exe" -e bash -lc $wslCmd

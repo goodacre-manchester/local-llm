@@ -120,8 +120,97 @@ services:
       - OLLAMA_BASE_URL=http://127.0.0.1:11434
       - WEBUI_AUTH=true
       - PORT=8080
+      # Wire Open WebUI's image generation engine to the sd-webui container
+      # below. The chat UI's "image" button on any assistant reply POSTs the
+      # message text as a prompt to this endpoint. See README → "Image
+      # generation". These admin settings can still be overridden per-user in
+      # Settings → Images, but defaulting them avoids first-run setup.
+      - ENABLE_IMAGE_GENERATION=true
+      - IMAGE_GENERATION_ENGINE=automatic1111
+      - AUTOMATIC1111_BASE_URL=http://127.0.0.1:7860
+      - IMAGE_GENERATION_MODEL=Juggernaut-XL_v9_RunDiffusionPhoto_v2
+      - IMAGE_SIZE=1024x1024
+      - IMAGE_STEPS=30
     volumes:
       - ./storage/open-webui:/app/backend/data
     depends_on:
       rag-server:
         condition: service_healthy
+
+  # Stable Diffusion WebUI (Automatic1111) — image-generation backend that
+  # Open WebUI's per-message "image" button hits. Heavy first boot (clones
+  # A1111 + installs torch + xformers, ~10 min); idle CPU thereafter, GPU only
+  # during generation. Co-resident with Ollama on the GPU (see README →
+  # "Image generation" for the VRAM-coexistence notes vs gemma4 / !deep).
+  #
+  # Not on network_mode: host because ai-dock's entrypoint binds 0.0.0.0
+  # internally; a port mapping is cleaner. Open WebUI (host network) reaches
+  # it via 127.0.0.1:7860 just fine.
+  sd-webui:
+    image: ghcr.io/ai-dock/stable-diffusion-webui:latest-cuda
+    container_name: local-llm-sd-webui
+    restart: unless-stopped
+    ports:
+      - "7860:7860"
+    # See scripts/sd-webui-entrypoint.sh for the full rationale. Short version:
+    # ai-dock's :latest-cuda ships torch 2.4.0+cu121 whose kernels stop at
+    # sm_90, so RTX 50-series (Blackwell, sm_120) GPUs fail at generate time
+    # with "no kernel image is available for execution on the device". The
+    # wrapper pip-upgrades to torch 2.11.0+cu128 (which ships sm_100+sm_120
+    # kernels) on every container CREATION, then hands off to ai-dock's
+    # normal init.sh. Idempotent: skips when already on a cu128 torch. Pip
+    # cache mount below makes repeat installs near-instant.
+    entrypoint: ["/bin/bash", "/usr/local/bin/sd-webui-entrypoint.sh"]
+    environment:
+      # --api enables the REST surface (/sdapi/v1/*) Open WebUI calls.
+      # --listen binds 0.0.0.0 so the port mapping actually reaches the WebUI.
+      # --cors-allow-origins=* lets the Open WebUI browser tab POST cross-origin.
+      # --no-half-vae avoids occasional black-image SDXL+VAE precision bugs.
+      # --opt-sdp-attention uses PyTorch's native scaled-dot-product attention
+      #   (modern, ~comparable speed to xformers). Required here because the
+      #   image's prebuilt xformers (built for torch 2.4.0+cu121) is ABI-
+      #   incompatible with our upgraded torch 2.11.0+cu128 and won't load.
+      - WEBUI_ARGS=--api --listen --cors-allow-origins=* --no-half-vae --opt-sdp-attention
+      - WEB_ENABLE_AUTH=false      # local-only stack; Open WebUI gates LAN.
+      - AUTO_UPDATE=false           # pin image; no silent A1111 upgrades on boot.
+      # Optional tokens for fetching gated HuggingFace / Civitai models from
+      # inside the container (harmless when blank).
+      - HF_TOKEN=${HF_TOKEN:-}
+      - CIVITAI_TOKEN=${CIVITAI_TOKEN:-}
+    volumes:
+      # /workspace mount kept for ai-dock's own conventions (Jupyter notebooks,
+      # auxiliary scripts) but it does NOT auto-symlink models into A1111's
+      # actual model dirs — the ai-dock storage_monitor that's supposed to
+      # bridge `${WORKSPACE}/storage/stable_diffusion/models/...` →
+      # `/opt/stable-diffusion-webui/models/...` is not enabled in this image.
+      # So below we bind-mount the host model dirs DIRECTLY into the A1111
+      # paths that the upstream code reads at startup. The host layout matches
+      # the workspace convention so `scripts/download-sd-models.ps1` keeps
+      # working unchanged and the same `.safetensors` files appear via both
+      # paths inside the container.
+      - ./storage/sd-webui:/workspace
+      - ./storage/sd-webui/storage/stable_diffusion/models/ckpt:/opt/stable-diffusion-webui/models/Stable-diffusion
+      - ./storage/sd-webui/storage/stable_diffusion/models/lora:/opt/stable-diffusion-webui/models/Lora
+      - ./storage/sd-webui/storage/stable_diffusion/models/vae:/opt/stable-diffusion-webui/models/VAE
+      - ./storage/sd-webui/storage/stable_diffusion/output:/opt/stable-diffusion-webui/outputs
+      # Wrapper that pip-upgrades torch to a Blackwell-capable wheel on every
+      # container creation (see entrypoint above).
+      - ./scripts/sd-webui-entrypoint.sh:/usr/local/bin/sd-webui-entrypoint.sh:ro
+      # Persist pip download cache across container recreates so the ~2.5 GB
+      # torch+CUDA wheel set is only downloaded once per host.
+      - ./storage/sd-webui/pip-cache:/root/.cache/pip
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:7860/sdapi/v1/options >/dev/null || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 20
+      # First boot clones A1111 + installs torch + xformers + downloads model
+      # configs — easily 10 minutes on a fresh host. Don't fail before that.
+      start_period: 900s

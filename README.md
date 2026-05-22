@@ -10,6 +10,7 @@ After startup, the following endpoints are available from Windows:
 - Ollama API: http://localhost:11434
 - RAG server health: http://localhost:3000/health
 - Chroma heartbeat: http://localhost:8000/api/v1/heartbeat
+- Stable Diffusion WebUI (Automatic1111): http://localhost:7860
 
 ## What each service does
 
@@ -17,14 +18,23 @@ After startup, the following endpoints are available from Windows:
 - Open WebUI (`8080`): browser chat interface connected to Ollama.
 - RAG server (`3000`): PDF ingestion and retrieval endpoints.
 - Chroma (`8000`): vector database for document embeddings.
+- sd-webui (`7860`): Automatic1111 Stable Diffusion WebUI; Open WebUI's per-message "image" button POSTs prompts here (see [Image generation (Automatic1111)](#image-generation-automatic1111)).
 
 ## Prerequisites
 
-- WSL2 Ubuntu with GPU passthrough working.
+- WSL2 Ubuntu with GPU passthrough working (Ollama uses the GPU natively).
 - Docker Engine and Compose plugin installed in WSL.
+- **NVIDIA Container Toolkit** installed in Docker — required by the
+  `sd-webui` container's GPU reservation. Bundled with Docker Desktop;
+  on hand-installed `docker-ce` in WSL it must be added once (see
+  [design.md §6.5](design.md)). Verify with:
+  ```powershell
+  wsl -e bash -lc "sudo docker run --rm --gpus all nvidia/cuda:12.4.1-base-ubuntu22.04 nvidia-smi"
+  ```
 - Ollama installed in WSL.
 
-Reference runbook: see design.md for full machine provisioning and architecture decisions.
+Reference runbook: see [design.md](design.md) for full machine provisioning,
+architecture decisions, and the new-machine quick-start sequence in §13.1.
 
 ## Start / Stop / Restart
 
@@ -139,6 +149,227 @@ contained: a Gemini provider in `server.js` keyed off the resolved profile,
 plus `GEMINI_API_KEY` / `GEMINI_MODEL` env (per profile). This is a deliberate
 local-→-cloud line-cross — left as a conscious decision for later rather
 than enabled by default.
+
+## Image generation (Automatic1111)
+
+Open WebUI has native image-generation support. With the `sd-webui` service in
+[docker-compose.yml](docker-compose.yml) wired in, any assistant reply in the
+chat gets a small **image** (picture) button — click it and the assistant's
+text is sent as a prompt to the local Stable Diffusion WebUI, which renders an
+image and inlines it into the conversation. No LLM-side "create image"
+protocol is needed; the LLM just produces a normal text reply and Open WebUI
+treats the click as a separate text→image dispatch.
+
+### The five things that must be in place
+
+If anything below is missing or skipped, image generation either doesn't work
+or fails silently. Each step links to its detailed subsection below.
+
+| # | What | Where | Done once per |
+|---|---|---|---|
+| 1 | **NVIDIA Container Toolkit** in the Docker daemon | [design.md §6.5.1](design.md) | Machine |
+| 2 | **SDXL checkpoint on disk** (`.safetensors` in the host model dir) | [§1 below](#1-download-a-base-model-66-gb) | Once |
+| 3 | **sd-webui container running + first boot complete** (incl. Blackwell torch upgrade on RTX 50-series) | [§2 below](#2-start-the-service-fully-automatic) | Auto on every boot |
+| 4 | **Open WebUI backend wired** to `http://127.0.0.1:7860` (pre-set via env; verify in Settings → Images) | [§3 below](#3-wire-open-webui-to-it) | Once (env-driven) |
+| 5 | **A chat trigger turned on** (Integrations → Images, per-message button, or tool calling) — Open WebUI does NOT auto-route based on LLM reply content | [§4 below](#4-generate-images-from-chat) | Per chat / per click |
+
+Step 5 is the one most users miss — the LLM emitting "I'll create an image…"
+or DALL·E-shaped JSON does **nothing** on its own. The trigger has to be
+explicit. See §4 below for the three trigger modes.
+
+### 1. Download a base model (~6.6 GB)
+
+The default checkpoint is **Juggernaut XL v9** (RunDiffusion's flagship SDXL
+fine-tune — strong general-purpose, photoreal-leaning, commercial-friendly
+licence). One-shot:
+
+```powershell
+.\scripts\download-sd-models.ps1
+```
+
+This downloads `Juggernaut-XL_v9_RunDiffusionPhoto_v2.safetensors` from
+HuggingFace into [storage/sd-webui/storage/stable_diffusion/models/ckpt/](storage/sd-webui/storage/stable_diffusion/models/ckpt/).
+Idempotent — re-runs only fetch what's missing or partial. Add more models by
+dropping any SDXL/SD1.5 `.safetensors` into the same folder and clicking
+**Settings → Reload UI** at http://localhost:7860, or just
+`docker compose restart sd-webui`.
+
+### 2. Start the service (fully automatic)
+
+`sd-webui` is part of the standard autostart chain — it's brought up by
+[scripts/ensure-services.sh](scripts/ensure-services.sh) (called by
+[start-local-llm.ps1](scripts/start-local-llm.ps1), itself called by the
+Startup-folder launcher on every Windows logon). After the one-time first
+boot, **you never need to touch it again** — `restart: unless-stopped` on
+the container plus the autostart launcher means every WSL/Windows restart
+re-activates image generation alongside chat and RAG.
+
+**First boot is slow** — the ai-dock image clones A1111, installs A1111's
+own dependencies, and downloads a default SD 1.5 checkpoint (10–15 minutes
+on a fresh host). On RTX 50-series (Blackwell) cards, the
+[scripts/sd-webui-entrypoint.sh](scripts/sd-webui-entrypoint.sh) wrapper
+additionally pip-installs `torch 2.11.0+cu128` into the A1111 venv before
+A1111 starts (adds ~3 min on first run; near-instant thereafter thanks to
+the host-mounted pip cache). See [design.md §6.5](design.md) for why this
+is needed — short version: ai-dock's image ships `torch 2.4.0+cu121` whose
+CUDA kernels only go up to `sm_90`, and RTX 50-series cards are `sm_120`.
+
+The autostart script does **not** block on first boot — chat is reachable
+immediately; the image-generation button will surface a transient error
+until first boot completes, then work on every subsequent reply. The
+autostart log prints `sd-webui (image generation): ready` once it's up.
+Subsequent boots take ~30 s.
+
+Verify it's up:
+
+```powershell
+wsl -e bash -lc "curl -fsS http://127.0.0.1:7860/sdapi/v1/options >/dev/null && echo 'sd-webui: ok'"
+```
+
+Tail first-boot progress:
+
+```powershell
+.\scripts\wsl-run.ps1 "sudo docker compose logs -f sd-webui"
+```
+
+### 3. Wire Open WebUI to it
+
+[docker-compose.yml](docker-compose.yml) pre-sets the engine env vars
+(`IMAGE_GENERATION_ENGINE=automatic1111`, `AUTOMATIC1111_BASE_URL=http://127.0.0.1:7860`,
+default model + size + steps), so for most setups **no admin-panel clicks are
+needed** — `docker compose up -d open-webui` after the env change is enough.
+
+To verify or override interactively in the browser:
+
+1. http://localhost:8080 → **Admin Panel** (top-right user menu)
+2. **Settings → Images**
+3. **Image Generation Engine:** `Default (Automatic1111)`
+4. **AUTOMATIC1111 Base URL:** `http://127.0.0.1:7860`
+5. **Default Model:** `Juggernaut-XL_v9_RunDiffusionPhoto_v2`
+   (drop-down populates from sd-webui's `/sdapi/v1/sd-models` — if it's empty,
+   the service is still booting or the model file isn't in `models/ckpt/`)
+6. **Image Size:** `1024x1024` (SDXL native — anything smaller degrades quality)
+7. **Steps:** `30` (good speed/quality balance; 50 for max quality, 20 for fast)
+8. **Save**
+
+While you're in Admin Panel, also check **Settings → Connections** for any
+stray `https://127.0.0.1:3000/v1` entry — it will spam SSL-handshake errors
+in the open-webui log against the plain-HTTP rag-server. The correct entry
+is `http://127.0.0.1:3000/v1`. Remove duplicates / fix the scheme and save.
+(If editing in the UI is awkward, [design.md §12.1](design.md) documents the
+direct SQLite cleanup recipe used during install.)
+
+### Smoke-test the backend without Open WebUI
+
+Useful when you want to know the bug is in the chat layer vs the image
+backend. Loads the default checkpoint and generates a 1024×1024 PNG to
+`d:\tmp\sd-smoke-test.png`:
+
+```powershell
+wsl -e bash -lc "curl -fsS -X POST http://127.0.0.1:7860/sdapi/v1/options \
+  -H 'Content-Type: application/json' \
+  -d '{\"sd_model_checkpoint\":\"Juggernaut-XL_v9_RunDiffusionPhoto_v2\"}' \
+  --max-time 180 && \
+  curl -fsS -X POST http://127.0.0.1:7860/sdapi/v1/txt2img \
+  -H 'Content-Type: application/json' \
+  -d '{\"prompt\":\"a single ripe red apple on a wooden table, soft window light, photorealistic\",\"steps\":20,\"width\":1024,\"height\":1024,\"sampler_name\":\"Euler a\",\"cfg_scale\":6}' \
+  --max-time 300 -o /tmp/sd-smoke.json && \
+  python3 -c 'import json,base64; png=base64.b64decode(json.load(open(\"/tmp/sd-smoke.json\"))[\"images\"][0]); open(\"/mnt/d/tmp/sd-smoke-test.png\",\"wb\").write(png); print(\"OK:\",len(png),\"bytes\")'"
+```
+
+If this returns `OK: <bytes>` and the PNG looks right, sd-webui is fully
+healthy and anything still broken is in Open WebUI's chat-trigger config (§4
+below), not the backend.
+
+### 4. Generate images from chat
+
+Open WebUI does **not** route image generation based on the LLM's response
+text — even if the model emits DALL·E-shaped JSON, OW just renders it as
+plain text. Image generation has to be triggered explicitly via one of:
+
+- **Auto-image per reply (Integrations menu — recommended for "ask, get
+  image"):** in the chat input area, click the **Integrations** icon (it's
+  the `+` / puzzle-piece button left of the message box — labelled
+  **Integrations** on newer OW versions, **More** / **+** on older ones) →
+  toggle **Images** on. From then on, every assistant reply *in that chat*
+  also runs through sd-webui and inlines a generated image below the text.
+  This is the trigger that makes natural-language requests like "create an
+  image of …" actually produce an image. Costs ~6–10 s and ~8 GB VRAM per
+  reply on SDXL — toggle it off when you don't want images.
+- **Per-message manual:** every assistant reply has an **image** icon in its
+  message toolbar — click it; the reply's text becomes the prompt; the
+  rendered image appears as a follow-up. Use when you only occasionally want
+  an image and don't want auto-gen running on every reply.
+- **Tool calling (advanced, optional):** Admin Panel → Settings → Models →
+  set **Function Calling = Native** globally, then on each model toggle the
+  **Image Generation** capability under **Capabilities** / **Default
+  Features**. With this on, the LLM emits a `generate_image` tool call
+  which OW catches and dispatches to A1111. Requires the model to do native
+  function calling reliably; not all local models do.
+
+### GPU coexistence with Ollama (16 GB card)
+
+The current config keeps both runtimes resident — CUDA juggles the VRAM:
+
+| Loaded together | Approx VRAM | Status |
+|---|---|---|
+| `gemma4:e4b` (fast) + SDXL (Juggernaut XL) | ~10 GB / 16 | comfortable headroom |
+| `gemma4:e4b` + SDXL during a generation | ~13 GB / 16 | fine, tight on activations |
+| `qwen2.5-coder:32b` (`!deep`) + SDXL | exceeds 16 GB | OOM if both active concurrently |
+
+`!deep` already CPU-offloads on a 16 GB card, so running an SDXL generation
+mid-`!deep`-answer just steals more VRAM and slows both. Practical pattern:
+use `!deep` for hard contrastive lookups, fast model for everything else, and
+image generation only on top of fast-model replies. If you hit OOM, either
+generate images between `!deep` turns rather than during them, or switch the
+checkpoint to a **Lightning** variant (4-step generation, ~3-5 s/image,
+much shorter VRAM-occupancy window).
+
+### Troubleshooting
+
+- **"I asked the model to make an image and got JSON/text back":** Open
+  WebUI does NOT route based on the LLM's reply content. The model emitting
+  DALL·E-shaped JSON or text like "I'll generate an image…" does nothing on
+  its own. You need an explicit trigger — easiest is **Integrations →
+  Images** in the chat input (§4 above). Confirm: the input box should show
+  a small **Images** chip/badge when the toggle is on.
+- **Open WebUI says "Failed to generate image":** check sd-webui logs —
+  `.\scripts\wsl-run.ps1 "sudo docker compose logs --tail=200 sd-webui"`.
+  Most common causes: model file missing from `models/ckpt/`, first boot
+  still installing, or VRAM OOM (see table above). Run the curl smoke test
+  in §3 to isolate backend vs Open WebUI.
+- **Model drop-down is empty in Admin → Images:** sd-webui is reachable
+  (`curl http://127.0.0.1:7860/sdapi/v1/options` works) but no `.safetensors`
+  is in `models/ckpt/`. Re-run `.\scripts\download-sd-models.ps1` and
+  `docker compose restart sd-webui`.
+- **Open WebUI log spams `[SSL: WRONG_VERSION_NUMBER]` against
+  `127.0.0.1:3000`:** there's a stray `https://127.0.0.1:3000/v1` entry in
+  the OpenAI connections list. Fix in Admin Panel → **Settings →
+  Connections** by removing/correcting the https entry (the rag-server is
+  plain HTTP). See [design.md §12.1](design.md) for the direct SQLite
+  cleanup recipe if the UI fights you.
+- **GPU not visible inside the container:** confirm NVIDIA Container Toolkit
+  is installed in the Docker daemon (Docker Desktop bundles it; hand-installed
+  `docker-ce` in WSL does NOT — see [design.md §6.5.1](design.md) for the
+  install procedure). Test:
+  `wsl -e bash -lc "sudo docker run --rm --gpus all nvidia/cuda:12.4.1-base-ubuntu22.04 nvidia-smi"`.
+- **"CUDA error: no kernel image is available for execution on the device"
+  in sd-webui logs:** the container's PyTorch lacks kernels for your GPU's
+  compute capability. The
+  [scripts/sd-webui-entrypoint.sh](scripts/sd-webui-entrypoint.sh) wrapper
+  upgrades to `torch 2.11.0+cu128` (covers `sm_100`/`sm_120` Blackwell) on
+  every container creation; if you see this error, the wrapper either didn't
+  run or its `pip install` failed. Check the boot log for the
+  `[sd-webui-entrypoint]` lines and confirm the wrapper file is mounted at
+  `/usr/local/bin/sd-webui-entrypoint.sh`. For non-Blackwell cards needing
+  a different arch, edit `TARGET_TORCH` in the wrapper. Full background in
+  [design.md §6.5.2](design.md).
+- **xformers warning at sd-webui startup ("xformers can't load C++/CUDA
+  extensions"):** expected and harmless. The image's bundled xformers is
+  ABI-pinned to torch 2.4.0+cu121, so it can't load against the upgraded
+  cu128 torch. We use `--opt-sdp-attention` in `WEBUI_ARGS` instead
+  (PyTorch's native scaled-dot-product attention, comparable speed). No
+  action needed.
 
 ## Auto-start after reboot
 

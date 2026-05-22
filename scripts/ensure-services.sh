@@ -74,9 +74,22 @@ main() {
   start_ollama_if_needed
 
   log "Bringing up containers"
-  compose_cmd up -d chroma rag-server open-webui
+  # No service names → brings up EVERY service in docker-compose.yml. Newly
+  # added services (reranker, sd-webui, …) auto-join without editing this
+  # script. `up -d` is idempotent on already-running containers, so this is
+  # safe to run on every boot.
+  compose_cmd up -d
 
-  log "Waiting for service health endpoints"
+  log "Waiting for critical service health endpoints"
+  # Only the user's critical path is waited on (chat must be reachable):
+  #   - chroma + rag-server + open-webui  → blocked
+  #   - reranker                         → started, not waited (5+ min first
+  #     boot installs torch; rag-server degrades to fused order if it's down)
+  #   - sd-webui                         → started, not waited (10+ min first
+  #     boot clones A1111 + installs torch/xformers; blocking here would
+  #     delay chat access. Image generation works as soon as it finishes
+  #     booting in the background; users can verify with
+  #     `curl http://127.0.0.1:7860/sdapi/v1/options`.)
   wait_for_http "http://127.0.0.1:8000/api/v1/heartbeat" 120 || {
     log "Chroma health check failed"
     exit 1
@@ -94,7 +107,21 @@ main() {
     wait_for_http "http://127.0.0.1:8080/health" 180 || exit 1
   }
 
-  log "All local LLM services are healthy"
+  log "All critical local LLM services are healthy"
+
+  # Non-blocking status probe of the background-starting services so the
+  # autostart log makes it obvious whether image-gen is already usable.
+  if curl -fsS --max-time 3 http://127.0.0.1:7860/sdapi/v1/options >/dev/null 2>&1; then
+    log "sd-webui (image generation): ready"
+  else
+    log "sd-webui (image generation): still booting in background — try again in a few minutes"
+    log "  first-boot install can take 10+ min; tail with: docker compose logs -f sd-webui"
+  fi
+  if curl -fsS --max-time 3 http://127.0.0.1:8008/health >/dev/null 2>&1; then
+    log "reranker: ready"
+  else
+    log "reranker: still booting in background (rag-server degrades gracefully if it's not ready yet)"
+  fi
 
   # Keep this process alive so WSL remains Running and Docker stays reachable
   # from Windows.  WSL auto-terminates when no user-space session is open (even

@@ -1,231 +1,127 @@
-# Nemotron RAG Eval — Session Handoff (2026-05-24)
+# Nemotron RAG Eval — Final State (2026-05-24, eval complete)
 
-This is the continuation document for the Nemotron 3 RAG evaluation work
-started 2026-05-22. Drop into a fresh session and you can resume from
-exactly where this leaves off.
-
-Original plan: `~/.claude/plans/concurrent-scribbling-cocke.md`.
-Baseline / Phase 2 work is in the previous commit chain
-(`3488922` and earlier). Phase 3a in-flight work is the latest commit.
+Five-phase evaluation of three NVIDIA Nemotron 3 components against the
+local-llm RAG pipeline's documented TAS-vs-PSFP failure class. **All five
+phases run.** Full results in `scripts/benchmark/BENCHMARK-RESULTS.md`.
+This file is the per-session resumption doc; consume the results doc for
+the actual findings + recommendation.
 
 ---
 
-## TL;DR — where we are
+## TL;DR — what shipped, what was rejected, what to do next
 
-| Phase | Result |
+| Component | Result | Status |
+|---|---|---|
+| Phase 1 — benchmark scaffolding | **done** in commit `3488922` | Locked in |
+| Phase 2 — Nemotron-3-Nano 30B-A3B generation | **+1 fix, −24% median latency** | **Adopt** as `CHAT_MODEL_DEEP` |
+| Phase 3a — Nemotron Parse v1.2 on `8021Q-2022.pdf` §8.6 + §12.29 (39 pages) | **+2 fixes, 0 regressions** | **Best single change.** Re-extract full IEEE corpus when time permits (~6.5h) |
+| Phase 3b — Full IEEE corpus through Parse | **not run** — gated on hardware time | Documented as follow-up; not blocking adoption decision |
+| Phase 4 — Nemotron embed-vl-1b + rerank-1b | **−1 regression vs Phase 3a** | **Reject** for this corpus. Diagnosis below. |
+| Phase 4b — Phase 4 minus embed (Nemotron rerank only) | Also **−1 regression vs Phase 3a** | Reject. Isolates the regression to the rerank's deprioritization of §12.29.1 ("managed objects" config tables) on broader semantic questions. |
+| Phase 5 — Stacked combined (Parse + Nemotron gen via override) | 4/6 with `-ProfileOverride` (artifact, see results doc); production-form 4-5/6 | Promote-to-default decision documented in BENCHMARK-RESULTS.md |
+
+**Recommendation** (from BENCHMARK-RESULTS.md, not yet applied to compose):
+1. `CHAT_MODEL_DEEP` → `nemotron-3-nano:30b-a3b-q4_K_M`
+2. Re-extract `data/ieee/` via Nemotron Parse (one-time, ~6.5h wall-clock,
+   GPU-only; image-gen paused).
+3. **Keep `nomic-embed-text` + `bge-reranker-base`.** Do NOT swap to
+   Nemotron embed/rerank for this corpus.
+
+None of these are applied yet — left as deliberate user decisions after
+the eval landed.
+
+---
+
+## Where the per-phase eval JSONs live
+
+`scripts/benchmark/results/<run-id>/` (gitignored, local only):
+
+| Run ID | What |
 |---|---|
-| 1 — benchmark scaffolding + baseline | ✅ **done** — `2/6 pass`, 4 real RAG failures, baseline data in `scripts/benchmark/results/baseline-20260522-1951/` |
-| 2 — Nemotron 3 Nano 30B-A3B (gen swap) | ✅ **done** — `3/6 pass`, fixed `axi-intc-register`, −24% median latency vs baseline. Committed `3488922`. |
-| 2b/c — Qwen 3.6 (27b dense, 35b-a3b MoE) | ⚠ **conclusively too slow on 16 GB** — every long-answer prompt exceeds 700s on this hardware. Models pulled and in library; not viable for default use. |
-| 3a — Nemotron Parse on TAS PDF | 🚧 **in flight** — vLLM-serving path proved brittle (4 vLLM versions tried, all produced degenerate output). Pivoting to NVIDIA's documented Option B: in-process HF transformers. Bootstrap of `.venv-nemo` running in background at handoff time. |
-| 3b — Parse on full IEEE corpus | ⏸ blocked on 3a |
-| 4 — Nemotron embed + rerank | ⏸ not started — most likely to actually fix TAS-vs-PSFP per all evidence |
-| 5 — combined report + promote-to-default decision | ⏸ not started |
+| `baseline-20260522-1951` | Baseline (`ieee` + `amd` collections, default stack). 2/6. |
+| `p2-nemo-gen-20260522-2324` | Phase 2 (Nemotron gen). 3/6. |
+| `p3a-nemo-parse-tas-20260524-2200` | Phase 3a (Parse extraction). 4/6 — **best**. |
+| `p4-nemo-rag-tas-20260524-2229` | Phase 4 (full Nemotron embed+rerank). 3/6. |
+| `p4b-nemo-rerank-only-20260524-2253` | Phase 4b (nomic embed + Nemotron rerank). 3/6. |
+| `p5-combined-20260524-2335` | Phase 5 stacked (Parse + Nemotron gen via override). 4/6 (artifact). |
+
+Score with: `.\scripts\benchmark\score.ps1 -RunId <id> -CompareTo <other-id>`.
 
 ---
 
-## Definitive findings to date (do not redo)
+## Components left on disk after the eval
 
-1. **Baseline RAG failures (real, reproducible):** `tas-vs-psfp-1`, `tas-vs-psfp-2`,
-   `clause-explicit`, `axi-intc-register`. The first three are first-stage
-   retrieval failures — the §12.29 / §8.6.9 chunks never appear in the top-K
-   even with query expansion and reranker active. `clause-explicit` failing
-   even with "Clause 12.29" literally in the prompt was a **new finding**
-   contradicting what `NEXT-STEPS.md` claimed about the `/query` raw-retrieval
-   probe — possibly query-expansion in `/v1/chat/completions` is dispersing
-   focus. Worth investigating in isolation.
-
-2. **Generation-model swap fixes 1/4 real failures.** Both Nemotron 30B-A3B
-   and (in completed runs) qwen3.6:35b-a3b independently fix
-   `axi-intc-register` by cross-referencing offset → register-name from
-   retrieved chunks. None touch TAS/clause failures because those are
-   retrieval-side. **Phase 4 (embed+rerank) is where the meaningful win
-   should come.**
-
-3. **Hardware verified facts:**
-   - GPU: RTX 5070 Ti, sm_120 (Blackwell), 16 GB VRAM
-   - Nemotron 30B-A3B Q4_K_M: 24 GB, partial RAM spillover, ~150s/prompt — viable
-   - Qwen 3.6 27b dense and 35b-a3b: too slow for production (>700s/prompt) — pull-but-don't-default
-   - Nemotron Parse (~3.75 GB) + HF/torch overhead (~2 GB) = ~6 GB GPU footprint — fits comfortably
-
-4. **Infra issues uncovered + fixed (all committed in `3488922`):**
-   - undici 5-min `bodyTimeout` was silently killing long-generation requests
-     (Qwen 3.6 hit this; Nemotron came within 60s). Fixed via
-     `setGlobalDispatcher` in `app/server.js` (override via
-     `FETCH_BODY_TIMEOUT_MS` env, default 30 min).
-   - Qwen 3.6's hybrid-thinking tokens overflow `num_ctx=12288`. Fixed via
-     per-model bump to 24576 in `resolveModel()` for `qwen3.6:*`.
-
-5. **vLLM serving of Nemotron Parse v1.2 is brittle on this stack** (still
-   open as of handoff). Tried `vllm/vllm-openai:v0.14.1` → `v0.21.0`,
-   added `--chat-template-content-format openai` (so images actually reach
-   model), installed missing `open_clip_torch` + `albumentations`. Vision
-   encoder runs, model produces ~300 chars of real content, then collapses
-   into token-repeat loops regardless of sampling parameters. Pattern is
-   consistent across versions. The model card's documented Option B (direct
-   HF transformers + bundled `GenerationConfig`) doesn't go through vLLM's
-   chat API and should sidestep this — that's the active pivot.
+| Location | Purpose |
+|---|---|
+| `scripts/extract/extract-nemo.py` + `extract-nemo.ps1` + `.venv-nemo/` | Parse extraction tooling (adopt path). Supports `NEMO_PARSE_PAGES` env for slice extraction. |
+| `scripts/nemo-rag/server.py` | embed + rerank HF sidecar (Phase 4 infra). Quiet on disk; revival gate for future Nemotron model releases. |
+| `storage/nemo-parse/hf-cache/` | HF cache (Parse + embed + rerank). ~10 GB. |
+| `data/ieee-nemo-parse-tas/` | Phase 3a slice (Parse-extracted, 39 pages). |
+| `data/ieee-nemo-rag-tas/` | Phase 4 collection (Nemotron embed + rerank). |
+| `data/ieee-nemo-rerank-tas/` | Phase 4b collection (nomic embed + Nemotron rerank). |
+| `docker-compose.yml` `NEMO_RAG_URL`/`NEMO_EMBED_COLLECTIONS`/`NEMO_RERANK_COLLECTIONS` env vars | Per-feature opt-in routing (inert when sidecar not running). |
+| `nemo-parse` compose service | Original vLLM Parse attempt — kept stopped, flagged deprecated. |
 
 ---
 
-## What's in flight at handoff
+## How to resume the sidecar for a future re-bench
 
-**~~Background task `bhe11dhv9`~~ COMPLETED 2026-05-24 evening** —
-`scripts/extract/.venv-nemo` bootstrap finished cleanly. Verified packages
-in the venv:
+```bash
+# 1. Start nemo-rag sidecar in WSL (~3-5 min model load from local HF cache):
+wsl -e bash -lc "cd /mnt/d/Projects/local-llm/scripts/extract && \
+  . .venv-nemo/bin/activate && \
+  export HF_HOME=/mnt/d/Projects/local-llm/storage/nemo-parse/hf-cache && \
+  python /mnt/d/Projects/local-llm/scripts/nemo-rag/server.py"
 
-  - `torch 2.11.0+cu128` (Blackwell sm_120 ready)
-  - `torchvision 0.26.0+cu128`
-  - `transformers 5.9.0`, `accelerate 1.13.0`, `open_clip_torch 3.3.0`
-  - `albumentations 2.0.8`, `einops 0.8.2`, `pymupdf 1.27.2.3`, `pillow 12.2.0`
-  - `torch.cuda.is_available() == True` confirmed inside the venv
+# 2. Recreate rag-server so it picks up the env (already wired):
+wsl -e bash -lc "cd /mnt/d/Projects/local-llm && sudo docker compose up -d rag-server"
 
-`.venv-nemo` is at `scripts/extract/.venv-nemo/` (gitignored). The Parse
-model weights have NOT been downloaded yet — that happens on first
-`AutoModel.from_pretrained()` call (first smoke-test or first
-extraction run), ~3.75 GB into `storage/nemo-parse/hf-cache/` (gitignored).
-
-So the next session can **skip step 4 (bootstrap) in the resumption
-sequence below** and go straight to step 5.
-
-**Container state at handoff:**
-  - `chroma`, `rag-server`, `reranker`, `open-webui`: healthy, normal
-  - `sd-webui`: **stopped** (freed GPU for Parse extraction)
-  - `nemo-parse` (vLLM): **stopped** (deprecated for now; compose entry kept
-    in `docker-compose.yml` in case a future vLLM release fixes the brittle
-    output). To resume image-gen: `sudo docker compose start sd-webui`.
-
----
-
-## Exact resumption sequence (copy/paste)
-
-```powershell
-# 1. Confirm where we are
-git log --oneline -5
-git status --short
-
-# 2. Read this doc + the plan file
-#    - this NEXT-STEPS-NEMOTRON-EVAL.md
-#    - ~/.claude/plans/concurrent-scribbling-cocke.md
-
-# 3. Bring sd-webui back up if you want image gen during the session
-#    (NOT required for extraction; skip until Phase 3a is done)
-wsl -e bash -lc "cd /mnt/d/Projects/local-llm && sudo docker compose start sd-webui"
-
-# 4. ~~Bootstrap .venv-nemo~~ DONE 2026-05-24 (~6 GB torch/transformers/deps).
-#    `scripts/extract/.venv-nemo` already exists and imports cleanly. Parse
-#    model weights still need their first-call download (~3.75 GB) -- happens
-#    automatically on the first AutoModel.from_pretrained() call in step 6.
-
-# 5. Set up the parallel collection for Phase 3a
-#    (single PDF, to validate end-to-end before doing the full IEEE corpus)
-mkdir d:\Projects\local-llm\data\ieee-nemo-parse-tas
-copy d:\Projects\local-llm\data\ieee\8021Q-2022.pdf d:\Projects\local-llm\data\ieee-nemo-parse-tas\
-# (symlinks would also work; copy is simpler on Windows)
-
-# 6. Run the extraction (will be SLOW -- 2163 pages * ~5s each = 3+ hours)
-.\scripts\extract-nemo.ps1 ieee-nemo-parse-tas
-# This writes data/ieee-nemo-parse-tas/.rag-cache/8021Q-2022.pdf.json
-# with backend="nemotron-parse-v1.2".
-
-# 7. Ingest the new sidecars into a parallel Chroma collection
-wsl -e bash -lc "curl -fsS -X POST http://127.0.0.1:3000/collections/ieee-nemo-parse-tas/ingest"
-# This embeds via the existing nomic-embed-text (so the variable being
-# tested is ONLY extraction quality).
-
-# 8. Run the benchmark with the new collection on the same prompts
-$ts = Get-Date -Format 'yyyyMMdd-HHmm'
-.\scripts\benchmark\run.ps1 -RunId "p3a-nemo-parse-tas-$ts" `
-    -CollectionOverride "ieee-nemo-parse-tas" `
+# 3. Bench the Nemotron-routed collection(s):
+.\scripts\benchmark\run.ps1 -RunId "rebench-<date>" \
+    -CollectionOverride "ieee-nemo-rag-tas" \
     -OverrideOnlyCollection "ieee"
-
-# 9. Score + compare vs baseline
-.\scripts\benchmark\score.ps1 -RunId "p3a-nemo-parse-tas-<ts>" `
-    -CompareTo "baseline-20260522-1951"
-
-# 10. Decision gate: if Phase 3a fixed any TAS / clause-explicit prompts,
-#     proceed to Phase 3b (full IEEE corpus, hours-long extraction).
-#     Otherwise skip to Phase 4 (embed + rerank).
 ```
 
 ---
 
-## Outstanding decisions (queued for the next session)
+## Things proven this won't work — don't redo without strong new evidence
 
-1. **Smoke-test confirms Parse produces stable output via HF transformers?**
-   If yes → run full PDF extraction. If no → escalate (try `transformers`
-   version pin, or fall back to Docling-only extraction for ieee-nemo-parse-tas
-   to test whether Parse-specific extraction matters at all vs just having
-   *any* clean extraction).
-
-2. **Phase 4 sequencing — go after Phase 3a or in parallel?** Phase 4 needs
-   different services (vLLM serving nemotron-embed and nemotron-rerank).
-   These are smaller (1B params each, ~5 GB total) and shouldn't have the
-   same brittle-output issue as Parse. The plan put Phase 4 after Phase 3a
-   but the user's evidence suggests Phase 4 is where the real recall win lives.
-
-3. **Promote-to-default decision for Phase 2 winner.** Nemotron 30B-A3B was
-   a clean +1 fix with -24% latency. Switching `CHAT_MODEL_DEEP` in
-   `docker-compose.yml` from `qwen2.5-coder:32b-instruct-q4_K_M` to
-   `nemotron-3-nano:30b-a3b-q4_K_M` is the obvious move. NOT done yet —
-   left as a deliberate user decision after Phase 3/4 results are in.
-
-4. **clause-explicit anomaly.** The new finding (explicit "Clause 12.29" in
-   prompt still doesn't retrieve §12.29 chunks via `/v1/chat/completions +
-   !deep + query expansion`) deserves a ~30 min isolated investigation:
-   probe `/query` directly with same wording and see if raw retrieval works.
-   If yes, the fix is in expansion/rerank routing — a much smaller fix than
-   any Nemotron swap.
+- vLLM serving of Nemotron Parse v1.2 (tried v0.14.1 + v0.21.0; identical
+  token-collapse output across versions).
+- Qwen 3.6 dense or MoE on 16 GB for production-latency RAG (>700s/prompt
+  on any non-trivial generation; partial CPU-spill bottleneck).
+- Nemotron `llama-nemotron-embed-vl-1b-v2` + `rerank-1b-v2` as a drop-in
+  for nomic-embed/bge-reranker on this IEEE-spec corpus (regressed
+  `tas-vs-psfp-2` in both full and rerank-only configurations).
 
 ---
 
-## File pointers for the new session
+## Outstanding follow-ups (none blocking; pick up if/when)
 
-| What | Where |
-|---|---|
-| Full plan (originally approved) | `~/.claude/plans/concurrent-scribbling-cocke.md` |
-| Benchmark prompts + automated rules | `scripts/benchmark/prompts.json` |
-| Benchmark runner | `scripts/benchmark/run.ps1` |
-| Benchmark scorer | `scripts/benchmark/score.ps1` |
-| Baseline + Phase 2 results | `scripts/benchmark/results/` (gitignored; local only) |
-| Phase 2 commit | `3488922` (see commit message for the full landed work) |
-| Phase 3a (in-flight) vLLM service | `docker-compose.yml` `nemo-parse` service (stopped) |
-| Phase 3a vLLM wrapper | `scripts/nemo-parse-entrypoint.sh` |
-| Phase 3a in-process extractor | `scripts/extract/extract-nemo.py` (HF transformers version) |
-| Phase 3a wrapper | `scripts/extract-nemo.ps1` |
-| Phase 3a heavy deps | `scripts/extract/requirements-nemo.txt` |
-| Phase 3a venv (host) | `scripts/extract/.venv-nemo/` (gitignored) |
-| HF model cache (Parse weights) | `storage/nemo-parse/hf-cache/` (gitignored) |
-| Plan-related memory | `~/.claude/projects/d--Projects-local-llm/memory/` |
-
----
-
-## Things that will save the next session time
-
-- **Don't re-attempt vLLM serving of Parse** without strong new evidence
-  (e.g. a specific vLLM release notes entry that mentions multimodal
-  generation_config wiring). We tried v0.14.1 and v0.21.0; both produced
-  identical degenerate output. The brittleness is in vLLM's chat API
-  pathway, not specific to the version we picked.
-- **Don't re-eval Qwen 3.6 unless hardware upgrades.** All three Qwen 3.6
-  configurations (27b dense, 35b-a3b MoE, both with bumped ctx and undici
-  fix) clustered at >700s/prompt — that's MoE compute on partial-CPU-spill,
-  not solvable without more VRAM.
-- **The undici timeout fix benefits everything**, not just Qwen 3.6. Keep it.
-- **Nemotron 30B-A3B is genuinely faster than dense qwen2.5-coder:32b** on
-  this hardware (-24% median latency) even with similar VRAM spill, because
-  MoE active params are 3B vs dense 32B. Worth promoting to default once
-  Phase 3/4 finish.
+1. **Phase 3b — extract full IEEE corpus through Parse.** ~6.5h wall-clock
+   for `8021Q-2022.pdf` alone (warm avg 10.8s/page × 2163 pages); plus
+   the other 26 IEEE PDFs. Run overnight when GPU isn't otherwise needed.
+2. **Fix `resolveModel` literal-override topK semantics** — currently
+   `<col>!<literal-model>` inherits FAST topK (8) instead of DEEP topK
+   (15). One-line fix; documented in BENCHMARK-RESULTS.md "Phase 5
+   caveat". Affects benchmarks using `-ProfileOverride` and any
+   user-facing literal-tag override.
+3. **Try `nvidia/llama-embed-nemotron-8b`** — text-only, larger
+   (~16 GB VRAM in bf16). Would test whether the Phase 4 regression
+   is the multimodal embedder being weak on technical text vs all
+   Nemotron embedders being weak. Heavy enough to need its own GPU
+   budget decision.
+4. **`clause-explicit` /query-probe investigation** — flagged in the
+   prior session as a ~30-min isolated investigation: probe `/query`
+   directly with "Clause 12.29" wording to confirm whether the
+   pre-Phase-3a failure was query-expansion dispersing focus or raw
+   retrieval scoring. clause-explicit now passes via Phase 3a, so
+   this is no longer urgent.
 
 ---
 
-## What this doc does NOT replace
+## Pointers
 
-- The plan file at `~/.claude/plans/concurrent-scribbling-cocke.md` — that's
-  the architectural design + per-phase rationale + risk register. Read it
-  first if you want the full "why each phase exists" context.
-- The Phase 2 commit message at `3488922` — that's the per-file change log
-  for what landed.
-- The README and design.md — those document the production stack; this doc
-  is eval-specific and shouldn't be promoted into them until/unless Phase 5
-  recommends a default change.
+- Plan file: `~/.claude/plans/concurrent-scribbling-cocke.md`
+- Per-phase results doc: `scripts/benchmark/BENCHMARK-RESULTS.md`
+- Memory file: `~/.claude/projects/d--Projects-local-llm/memory/nemotron-eval-2026-05.md`

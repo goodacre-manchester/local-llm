@@ -44,6 +44,28 @@ const MAX_SUBQUERIES = Number(process.env.MAX_SUBQUERIES || 5);
 const RERANKER_URL  = process.env.RERANKER_URL || "";
 // How many fused/deduped candidates to send to the reranker.
 const RERANK_CANDIDATES = Number(process.env.RERANK_CANDIDATES || 30);
+// Per-collection Nemotron routing (Phase 4 of the RAG eval). When NEMO_RAG_URL
+// is set, two independent comma-separated allowlists decide which collections
+// route which feature to the nemo-rag sidecar (scripts/nemo-rag/server.py):
+//   NEMO_EMBED_COLLECTIONS   — embed (ingest + query) via Nemotron instead of Ollama nomic
+//   NEMO_RERANK_COLLECTIONS  — rerank via Nemotron instead of bge-reranker
+// They're split so a collection can opt in to JUST rerank (nomic-embed kept,
+// 768-dim vectors) — the original full-Nemotron Phase 4 regressed first-stage
+// recall (Nemotron embed-vl is multimodal-tuned, weaker on long technical
+// text), but the rerank scored cleanly in isolation. Collections NOT listed
+// keep the default Ollama-embed + bge-rerank path. NEMO_RAG_COLLECTIONS
+// (legacy) still works as a shorthand for "this collection in both lists".
+const NEMO_RAG_URL = process.env.NEMO_RAG_URL || "";
+const _parseList = (v) => new Set(String(v || "").split(",").map((s) => s.trim()).filter(Boolean));
+const _legacyBoth = _parseList(process.env.NEMO_RAG_COLLECTIONS);
+const NEMO_EMBED_COLLECTIONS  = new Set([..._parseList(process.env.NEMO_EMBED_COLLECTIONS), ..._legacyBoth]);
+const NEMO_RERANK_COLLECTIONS = new Set([..._parseList(process.env.NEMO_RERANK_COLLECTIONS), ..._legacyBoth]);
+function useNemoEmbed(collectionName) {
+  return Boolean(NEMO_RAG_URL) && NEMO_EMBED_COLLECTIONS.has(String(collectionName || ""));
+}
+function useNemoRerank(collectionName) {
+  return Boolean(NEMO_RAG_URL) && NEMO_RERANK_COLLECTIONS.has(String(collectionName || ""));
+}
 // Near-duplicate handling: this corpus has the consolidated standard plus the
 // amendments and an ISO reprint, so the SAME text appears in several files
 // (8021Q-2022 ⊇ 8021Qbv-2015/8021Qci-2017; 8802-1Q-2024 is the ISO reprint).
@@ -156,14 +178,37 @@ function chunkText(text, chunkSize, overlap) {
 }
 
 /**
- * Embed a batch of strings in ONE Ollama call. Ollama's /api/embed accepts an
- * input array and returns an aligned embeddings array — batching cuts ingest
- * time by ~an order of magnitude vs one HTTP round-trip per chunk.
- * truncate:true degrades an over-long input to a truncated embedding instead
- * of a hard 400 that would abort the whole ingest.
+ * Embed a batch of strings in ONE call. Routes to the Nemotron sidecar if the
+ * collection is opted in via NEMO_RAG_COLLECTIONS; otherwise hits Ollama's
+ * /api/embed (nomic). Batching cuts ingest round-trips by ~an order of
+ * magnitude vs one request per chunk. truncate:true degrades an over-long
+ * input to a truncated embedding instead of failing the whole batch.
+ *
+ * `kind` is only consulted by the Nemotron path (bi-encoder needs separate
+ * query/document encoders). Ollama doesn't care.
  */
-async function embedTexts(inputs) {
+async function embedTexts(inputs, kind = "document", collectionName = "") {
   if (inputs.length === 0) return [];
+
+  if (useNemoEmbed(collectionName)) {
+    const response = await fetch(`${NEMO_RAG_URL}/embed`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ inputs, kind }),
+    });
+    if (!response.ok) {
+      const txt = await response.text();
+      throw new Error(`nemo-rag embed failed: ${response.status} ${txt}`);
+    }
+    const json = await response.json();
+    if (Array.isArray(json.embeddings) && json.embeddings.length === inputs.length) {
+      return json.embeddings;
+    }
+    throw new Error(
+      `nemo-rag embed: expected ${inputs.length} embeddings, got ${json.embeddings?.length}`
+    );
+  }
+
   const response = await fetch(`${OLLAMA_HOST}/api/embed`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -185,8 +230,8 @@ async function embedTexts(inputs) {
 }
 
 /** Single-string convenience (query path). */
-async function embedText(input) {
-  return (await embedTexts([input]))[0];
+async function embedText(input, collectionName = "") {
+  return (await embedTexts([input], "query", collectionName))[0];
 }
 
 async function readPdfText(filePath) {
@@ -578,7 +623,7 @@ async function ingestCollection(name, { force = false } = {}) {
         const slice = chunks.slice(s, s + BATCH);
         // One embed call for the whole batch (vs one per chunk) — the ingest
         // hot path; ~10x fewer round-trips on large corpora.
-        const embeddings = await embedTexts(slice.map((c) => c.embedInput || c.text));
+        const embeddings = await embedTexts(slice.map((c) => c.embedInput || c.text), "document", name);
         const ids = [], documents = [], metadatas = [];
         for (let j = 0; j < slice.length; j++) {
           const c = slice[j];
@@ -682,11 +727,18 @@ function dedupePreferCanonical(items) {
 /**
  * Optional cross-encoder rerank via the reranker sidecar. Best-effort: any
  * failure degrades to the input (fused) order, same as the BM25 channel.
+ *
+ * Routes to the Nemotron sidecar's /rerank when the collection is opted in
+ * via NEMO_RAG_COLLECTIONS; otherwise hits the bge-reranker at RERANKER_URL.
+ * Both speak the same {query, documents[]} -> {scores[]} protocol so the
+ * downstream sort is identical.
  */
-async function rerankItems(query, items) {
-  if (!RERANKER_URL || items.length <= 1) return items;
+async function rerankItems(query, items, collectionName = "") {
+  if (items.length <= 1) return items;
+  const url = useNemoRerank(collectionName) ? `${NEMO_RAG_URL}/rerank` : RERANKER_URL;
+  if (!url) return items;
   try {
-    const resp = await fetch(RERANKER_URL, {
+    const resp = await fetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ query, documents: items.map((i) => i.document) }),
@@ -724,7 +776,7 @@ async function retrieveCandidates(name, query) {
   const fetchN = Math.min(docCount, Math.max(topK * 6, RERANK_CANDIDATES * 2, 40));
 
   // Dense channel
-  const queryEmbedding = await embedText(query);
+  const queryEmbedding = await embedText(query, name);
   const dense = await chromaRequest(`/api/v1/collections/${colId}/query`, {
     method: "POST",
     body: JSON.stringify({
@@ -827,7 +879,7 @@ async function queryCollection(name, question, topK) {
     }
   }
   const merged = [...union.values()].sort((a, b) => (b.rrf || 0) - (a.rrf || 0));
-  const reranked = await rerankItems(question, merged.slice(0, RERANK_CANDIDATES));
+  const reranked = await rerankItems(question, merged.slice(0, RERANK_CANDIDATES), name);
   return reranked
     .slice(0, topK)
     .map(({ document, metadata, distance }) => ({ document, metadata, distance }));
@@ -1231,6 +1283,11 @@ app.listen(PORT, async () => {
   console.log(`Ollama         : ${OLLAMA_HOST}`);
   console.log(`Chroma         : ${CHROMA_URL}`);
   console.log(`Embedding model: ${EMBEDDING_MODEL}`);
+  if (NEMO_RAG_URL && (NEMO_EMBED_COLLECTIONS.size || NEMO_RERANK_COLLECTIONS.size)) {
+    console.log(`Nemo-RAG       : ${NEMO_RAG_URL}`);
+    if (NEMO_EMBED_COLLECTIONS.size)  console.log(`  embed for    : ${[...NEMO_EMBED_COLLECTIONS].join(", ")}`);
+    if (NEMO_RERANK_COLLECTIONS.size) console.log(`  rerank for   : ${[...NEMO_RERANK_COLLECTIONS].join(", ")}`);
+  }
   console.log(`Chat model     : ${CHAT_MODEL}`);
 
   const folders = await listCollectionFolders();

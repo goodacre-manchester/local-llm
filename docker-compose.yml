@@ -54,6 +54,26 @@ services:
       # Cross-encoder reranker (sidecar below). RAG degrades to fused order
       # if it is down/slow, so no depends_on is needed.
       - RERANKER_URL=http://127.0.0.1:8008/rerank
+      # Phase 4 of the RAG eval: opt-in per-collection routing to the Nemotron
+      # embed + rerank sidecar (scripts/nemo-rag/server.py, NOT a compose
+      # service -- runs natively in WSL inside scripts/extract/.venv-nemo
+      # because Nemotron multimodal models broke under vLLM in Phase 3a).
+      # Only collections listed in NEMO_RAG_COLLECTIONS are routed; every
+      # other collection keeps using nomic-embed + bge-reranker unchanged.
+      # When the sidecar isn't running, those listed collections will fail
+      # at embed time -- start the sidecar first:
+      #   wsl -e bash -lc "cd /mnt/d/Projects/local-llm/scripts/extract && \
+      #     . .venv-nemo/bin/activate && \
+      #     export HF_HOME=/mnt/d/Projects/local-llm/storage/nemo-parse/hf-cache && \
+      #     python /mnt/d/Projects/local-llm/scripts/nemo-rag/server.py"
+      - NEMO_RAG_URL=http://127.0.0.1:8009
+      # Per-feature opt-in lists. Full Nemotron (embed+rerank) regressed
+      # vs Phase 3a because the multimodal embed lost cross-chapter recall;
+      # Phase 4b keeps nomic-embed for first-stage and only routes rerank to
+      # Nemotron (where the in-isolation smoke gave +28 score advantage on
+      # the §12.29 contrast).
+      - NEMO_EMBED_COLLECTIONS=ieee-nemo-rag-tas
+      - NEMO_RERANK_COLLECTIONS=ieee-nemo-rag-tas,ieee-nemo-rerank-tas
     command: >
       sh -lc "npm install && node server.js"
     depends_on:

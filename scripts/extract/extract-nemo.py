@@ -25,6 +25,10 @@ Env overrides:
   NEMO_PARSE_MODEL_ID     nvidia/NVIDIA-Nemotron-Parse-v1.2
   NEMO_PARSE_TARGET_PX    2048    (render so longer page side = this many px)
   NEMO_PARSE_DEVICE       cuda:0  (or cpu for offload/test)
+  NEMO_PARSE_PAGES        ""      (e.g. "203-238,480-482" - 1-indexed page allowlist
+                                   for partial extraction; pages keep their
+                                   ORIGINAL numbers so _apply_toc still resolves
+                                   sections correctly from the PDF bookmarks)
   HF_HOME                 ~/.cache/huggingface (set to share with vLLM cache)
 """
 
@@ -51,7 +55,29 @@ from extract import _md_page_to_blocks, _apply_toc, _iso_mtime
 MODEL_ID  = os.environ.get("NEMO_PARSE_MODEL_ID", "nvidia/NVIDIA-Nemotron-Parse-v1.2")
 TARGET_PX = int(os.environ.get("NEMO_PARSE_TARGET_PX", "2048"))
 DEVICE    = os.environ.get("NEMO_PARSE_DEVICE",    "cuda:0")
+PAGES_ENV = os.environ.get("NEMO_PARSE_PAGES",     "").strip()
 PROMPT    = "</s><s><predict_bbox><predict_classes><output_markdown><predict_no_text_in_pic>"
+
+
+def _parse_pages_env(spec: str) -> set[int] | None:
+    """"203-238,480-482" -> {203, 204, ..., 238, 480, 481, 482}. Empty -> None
+    (meaning: all pages)."""
+    if not spec:
+        return None
+    out: set[int] = set()
+    for chunk in spec.split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        if "-" in chunk:
+            lo, hi = chunk.split("-", 1)
+            out.update(range(int(lo), int(hi) + 1))
+        else:
+            out.add(int(chunk))
+    return out
+
+
+PAGE_FILTER = _parse_pages_env(PAGES_ENV)
 
 # Lazy globals so import doesn't trigger model load (helps the --help/error path).
 _model: AutoModel | None = None
@@ -127,9 +153,15 @@ def _extract_nemotron_parse(pdf: Path) -> list[dict]:
     doc = fitz.open(str(pdf))
     n_pages = len(doc)
 
+    if PAGE_FILTER is not None:
+        print(f"    NEMO_PARSE_PAGES filter active: "
+              f"{len(PAGE_FILTER)} of {n_pages} pages will be processed", flush=True)
+
     page_errors = 0
     for i in range(n_pages):
         page_no = i + 1
+        if PAGE_FILTER is not None and page_no not in PAGE_FILTER:
+            continue
         try:
             png = _render_page_png(doc[i])
             if not png:

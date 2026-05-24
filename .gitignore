@@ -17,6 +17,9 @@ data/*/
 !data/*/.gitkeep
 storage/
 
+# Benchmark run outputs (the scripts + prompts.json are committed; results aren't)
+scripts/benchmark/results/
+
 # Editor / OS
 .vscode/*
 !.vscode/mcp.json

@@ -80,12 +80,17 @@ wsl -e bash -lc "sudo docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Port
 
 Models pulled by default:
 
-- llama3.1:8b-instruct-q8_0
-- qwen2.5-coder:32b-instruct-q4_K_M
-- deepseek-r1:14b
-- gemma4:e4b  (Google Gemma 4 edge, ~9.6GB — fits 16GB VRAM fully)
-- gemma4:26b  (Gemma 4 MoE, ~18GB — 4B active params/token; CPU-offloads on 16GB)
-- nomic-embed-text
+- `llama3.1:8b-instruct-q8_0`
+- `qwen2.5-coder:32b-instruct-q4_K_M` (current `CHAT_MODEL_DEEP` default)
+- `deepseek-r1:14b`
+- `gemma4:e4b`  (Google Gemma 4 edge, ~9.6GB — fits 16GB VRAM fully; current `CHAT_MODEL` default)
+- `gemma4:26b`  (Gemma 4 MoE, ~18GB — 4B active params/token; CPU-offloads on 16GB)
+- `qwen3.6:27b` (Qwen 3.6 dense, Apr 2026, Apache 2.0; ~17GB at Q4_K_M, minor 16GB spillover; hybrid-thinking, 256K-1M context)
+- `qwen3.6:35b-a3b` (Qwen 3.6 MoE, 35B total / 3B active per token; ~24GB at Q4_K_M, partial spillover but MoE keeps inference fast)
+- `nemotron-3-nano:30b-a3b-q4_K_M` (NVIDIA Nemotron 3 Nano, nemotron_h_moe hybrid Transformer-Mamba MoE, 31.6B / 3B active, reasoning-tuned; ~24GB, partial spillover)
+- `nomic-embed-text` (embedding model used by the RAG server)
+
+The newer Qwen 3.6 and Nemotron 3 Nano models are not wired into the default `CHAT_MODEL` / `CHAT_MODEL_DEEP` env vars in `docker-compose.yml` — they're available via the existing per-request `<collection>!<ollama:tag>` literal-override syntax (e.g. `ieee!qwen3.6:35b-a3b` in the OpenAI `model` field) so you can A/B test without changing defaults. Promote to default by editing `CHAT_MODEL_DEEP` in `docker-compose.yml` and `docker compose up -d rag-server`.
 
 ### Generation model & answer tuning
 

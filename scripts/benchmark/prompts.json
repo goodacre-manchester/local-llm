@@ -1,0 +1,90 @@
+{
+  "$schema_notes": "Benchmark prompt set for the Nemotron-3 evaluation plan and any future RAG regression work. Each prompt has automated pass/fail rules. Sources: NEXT-STEPS.md (TAS-vs-PSFP failure trail), test-rag.ps1 (Vitis HLS smoke), project-state-2026-05 memory (register / clause lookup happy paths). See scripts/benchmark/run.ps1 and score.ps1.",
+  "$rule_semantics": "expected_citations is an AND list of rules; each rule passes when ANY citation in the response matches both fileName_contains AND section_contains (substring, case-insensitive). currently_failing flags prompts the baseline is expected to fail — score script compares deltas. max_latency_s is a soft cap; over runs as a warning, not a failure.",
+  "prompts": [
+    {
+      "id": "tas-vs-psfp-1",
+      "question": "Is TAS the same as a PSFP stream gate, does it have an IPV?",
+      "collection": "ieee",
+      "profile": "deep",
+      "description": "Contrastive: PSFP-dominated vocabulary; expect TAS-defining clauses recalled and PSFP/IPV correctly distinguished.",
+      "expected_citations": [
+        { "fileName_contains": "8021Q-2022", "section_contains": "12.29" },
+        { "fileName_contains": "8021Q-2022", "section_contains": "8.6.9" }
+      ],
+      "must_not_abstain": true,
+      "max_latency_s": 600,
+      "currently_failing": true,
+      "source": "NEXT-STEPS.md unresolved failure case"
+    },
+    {
+      "id": "tas-vs-psfp-2",
+      "question": "Explain the differences between TAS, PSFP, and ATS in IEEE 802.1Q.",
+      "collection": "ieee",
+      "profile": "deep",
+      "description": "Contrastive: all three mechanisms named explicitly. Stronger first-stage recall expected vs tas-vs-psfp-1; still needs TAS clauses cited.",
+      "expected_citations": [
+        { "fileName_contains": "8021Q-2022", "section_contains": "12.29" },
+        { "fileName_contains": "8021Q-2022", "section_contains": "8.6.9" }
+      ],
+      "must_not_abstain": true,
+      "max_latency_s": 600,
+      "currently_failing": true,
+      "source": "NEXT-STEPS.md unresolved failure case, easier-phrasing variant"
+    },
+    {
+      "id": "clause-explicit",
+      "question": "What does Clause 12.29 of IEEE 802.1Q-2022 specify?",
+      "collection": "ieee",
+      "profile": "deep",
+      "description": "Retrieval regression guard — explicit clause number in the prompt should always recall §12.29 chunks.",
+      "expected_citations": [
+        { "fileName_contains": "8021Q-2022", "section_contains": "12.29" }
+      ],
+      "must_not_abstain": true,
+      "max_latency_s": 600,
+      "currently_failing": false,
+      "source": "NEXT-STEPS.md / query probe baseline"
+    },
+    {
+      "id": "vitis-hls-pragma",
+      "question": "What does pragma HLS pipeline do in Vitis HLS, and what options does it accept?",
+      "collection": "amd",
+      "profile": "deep",
+      "description": "AMD lookup regression guard -- well-known Vitis HLS pragma lookup against ug1399. (Original prompt asked about SCHED 200-880, which is a warning code, not a pragma; corrected after baseline run revealed the conflation.)",
+      "expected_citations": [
+        { "fileName_contains": "ug1399", "section_contains": "pipeline" }
+      ],
+      "must_not_abstain": true,
+      "max_latency_s": 600,
+      "currently_failing": false,
+      "source": "test-rag.ps1 / project-state-2026-05"
+    },
+    {
+      "id": "axi-intc-register",
+      "question": "What does register 0x04 in the AXI Interrupt Controller do?",
+      "collection": "amd",
+      "profile": "fast",
+      "description": "Register-by-hex-offset lookup; tests hybrid (BM25+dense) recall on exact alphanumeric tokens. Fast profile because regression risk is in retrieval, not generation depth.",
+      "expected_citations": [
+        { "fileName_contains": "", "section_contains": "" }
+      ],
+      "must_not_abstain": true,
+      "max_latency_s": 180,
+      "currently_failing": false,
+      "source": "project-state-2026-05 happy-path examples"
+    },
+    {
+      "id": "abstention-test",
+      "question": "What is the value assigned to the SCRPT_FOOBAR_42 register in the AMD AXI Interrupt Controller, and on what page of the datasheet is it documented?",
+      "collection": "amd",
+      "profile": "fast",
+      "description": "Abstention guard. SCRPT_FOOBAR_42 is a fabricated register that exists nowhere in the corpus AND can't be filled in by general training knowledge. Under RAG_GROUNDING=augmented the model is permitted to add tagged general knowledge for source gaps, but here there's no plausible general knowledge to lean on -- so it should still abstain or explicitly admit no coverage. Original prompt ('What is the capital of France?') was a poor test under augmented grounding because the model could correctly answer from general knowledge.",
+      "expected_citations": [],
+      "must_abstain": true,
+      "max_latency_s": 120,
+      "currently_failing": false,
+      "source": "Grounding guarantee from app/server.js ABSTAIN constant"
+    }
+  ]
+}

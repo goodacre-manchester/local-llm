@@ -5,8 +5,21 @@ import cors from "cors";
 import morgan from "morgan";
 import dotenv from "dotenv";
 import pdfParse from "pdf-parse";
+import { Agent, setGlobalDispatcher } from "undici";
 
 dotenv.config();
+
+// Bump undici's default 5-minute bodyTimeout / headersTimeout. Long-form
+// generations from verbose / partial-GPU-spilled models (Qwen 3.6, 30B+
+// dense on a 16 GB card, future vLLM-served Nemotron Parse/Embed/Rerank)
+// routinely exceed 5 min with stream:false. Default 30 min gives headroom.
+// Overridable via env so tests / smaller hardware can tighten if desired.
+const FETCH_BODY_TIMEOUT_MS    = Number(process.env.FETCH_BODY_TIMEOUT_MS    || 30 * 60 * 1000);
+const FETCH_HEADERS_TIMEOUT_MS = Number(process.env.FETCH_HEADERS_TIMEOUT_MS || 30 * 60 * 1000);
+setGlobalDispatcher(new Agent({
+  bodyTimeout:    FETCH_BODY_TIMEOUT_MS,
+  headersTimeout: FETCH_HEADERS_TIMEOUT_MS,
+}));
 
 const PORT          = Number(process.env.PORT || 3000);
 const OLLAMA_HOST   = process.env.OLLAMA_HOST   || "http://127.0.0.1:11434";
@@ -75,6 +88,15 @@ function resolveModel(modelField) {
     llmModel = CHAT_MODEL_DEEP; numCtx = CHAT_NUM_CTX_DEEP; topK = TOP_K_DEEP;
   } else if (profile && profile !== "fast") {
     llmModel = profile; // explicit "<collection>!ollama:tag" override
+  }
+  // Per-model num_ctx bump. Qwen 3.6 ships with hybrid-thinking ON; the
+  // reasoning tokens it emits before the final answer combined with our
+  // TOP_K source chunks overflow the default 12288 ctx on long answers
+  // (HTTP 500 from Ollama). Bumping to 24576 gives reasoning headroom.
+  // Only kicks in when a qwen3.6 model is explicitly requested via the
+  // literal-tag override (existing collections / profiles unaffected).
+  if (/^qwen3\.6:/i.test(llmModel)) {
+    numCtx = Math.max(numCtx, 24576);
   }
   return { base, llmModel, numCtx, topK };
 }

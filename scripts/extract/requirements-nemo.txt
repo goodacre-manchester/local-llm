@@ -1,0 +1,19 @@
+# Heavy ML deps for the in-process Nemotron Parse v1.2 extractor (extract-nemo.py).
+# Installed into a SEPARATE venv (.venv-nemo) so the lightweight extract.py venv
+# stays small. Bring it up via scripts/extract-nemo.ps1.
+#
+# IMPORTANT: torch + torchvision are NOT listed here because they must come from
+# PyTorch's cu128 index URL (Blackwell sm_120 support — same reason as
+# scripts/sd-webui-entrypoint.sh). The PowerShell wrapper installs them
+# explicitly first via:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
+#
+# The remaining deps are pypi-default-index installable.
+
+transformers>=4.45.0
+accelerate>=0.34.0
+open_clip_torch>=2.30.0
+albumentations>=1.4.0
+einops>=0.8.0
+pymupdf>=1.24.0
+pillow>=10.0.0

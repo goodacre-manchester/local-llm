@@ -214,3 +214,85 @@ services:
       # First boot clones A1111 + installs torch + xformers + downloads model
       # configs — easily 10 minutes on a fresh host. Don't fail before that.
       start_period: 900s
+
+  # Nemotron Parse v1.2 (NVIDIA) — vision-encoder-decoder document parser
+  # used by the Phase 3 RAG benchmark evaluation. NOT part of the autostart
+  # chain: omitted from `restart` policy intentionally so it only runs when
+  # explicitly brought up for an extraction job (`docker compose up -d
+  # nemo-parse`). Heavy GPU + first-boot — bring down when not in use.
+  #
+  # Architecture: ViT-H encoder + mBart decoder (<1B params). Takes rendered
+  # page images (PNG/JPEG, 1024x1280 min, 2048x1664 standard) via vLLM's
+  # OpenAI-compat chat completions API with image_url content; returns
+  # markdown + bbox + class metadata for downstream postprocessing.
+  #
+  # Used by scripts/extract/extract-nemo.py to produce sidecar JSON in the
+  # same shape as scripts/extract/extract.py (PyMuPDF4LLM backend) so
+  # app/server.js's existing loadSidecar/chunkBlocks paths consume both
+  # interchangeably. See plan: ~/.claude/plans/concurrent-scribbling-cocke.md
+  nemo-parse:
+    image: vllm/vllm-openai:v0.21.0-cu129-ubuntu2404
+    container_name: local-llm-nemo-parse
+    ports:
+      - "8009:8000"
+    environment:
+      - HF_HOME=/cache/hf
+      # Disable vLLM telemetry; we're local-only.
+      - DO_NOT_TRACK=1
+    volumes:
+      # Persist the HF download cache so the 3.75 GB model isn't re-pulled
+      # on every container creation.
+      - ./storage/nemo-parse/hf-cache:/cache/hf
+      # Persist pip cache so the open_clip install (~80MB + deps) doesn't
+      # re-download on every recreate.
+      - ./storage/nemo-parse/pip-cache:/root/.cache/pip
+      # Entrypoint wrapper that pip-installs open_clip_torch (missing from
+      # the upstream image but required by Parse's vision encoder). See
+      # script comments for rationale + removal criterion.
+      - ./scripts/nemo-parse-entrypoint.sh:/usr/local/bin/nemo-parse-entrypoint.sh:ro
+    # Override the image's entrypoint with our wrapper. The original image
+    # entrypoint is `vllm serve` which our wrapper invokes via `exec vllm
+    # serve "$@"`, so the args in `command:` flow through unchanged.
+    entrypoint: ["/bin/bash", "/usr/local/bin/nemo-parse-entrypoint.sh"]
+    # vLLM serve flags from NVIDIA-Nemotron-Parse-v1.2 model card. The
+    # quirky --limit-mm-per-prompt JSON needs to be passed as one string
+    # (list form of `command:` avoids YAML's shell-parsing).
+    command:
+      - "--model"
+      - "nvidia/NVIDIA-Nemotron-Parse-v1.2"
+      - "--dtype"
+      - "bfloat16"
+      - "--max-num-seqs"
+      - "8"
+      - "--limit-mm-per-prompt"
+      - '{"image":1}'
+      - "--trust-remote-code"
+      - "--port"
+      - "8000"
+      - "--served-model-name"
+      - "nemotron-parse"
+      # CRITICAL for multimodal: without this, vLLM auto-detects the chat
+      # template format as 'string' for Parse and silently flattens the
+      # image_url content out of the message, so the model receives only
+      # the prompt sentinel text with no image -- and hallucinates content
+      # unrelated to the input. 'openai' format preserves the structured
+      # multi-part content array.
+      - "--chat-template-content-format"
+      - "openai"
+    # vLLM needs increased shared memory for inter-process tensor sharing.
+    ipc: host
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request,sys; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=5); sys.exit(0)\" || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 20
+      # First boot pulls the ~3.75 GB model + installs from HF cache.
+      # Plan for 5-10 minutes on a fresh host.
+      start_period: 600s

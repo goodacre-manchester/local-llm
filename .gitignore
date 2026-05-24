@@ -9,6 +9,7 @@ node_modules/
 
 # Python venvs / caches
 **/.venv/
+**/.venv-nemo/
 **/__pycache__/
 *.pyc
 

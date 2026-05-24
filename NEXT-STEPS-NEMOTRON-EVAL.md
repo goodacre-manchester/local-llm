@@ -70,22 +70,23 @@ Baseline / Phase 2 work is in the previous commit chain
 
 ## What's in flight at handoff
 
-**Background task** `bhe11dhv9` (started ~2026-05-24 mid-day) is
-bootstrapping `scripts/extract/.venv-nemo`:
+**~~Background task `bhe11dhv9`~~ COMPLETED 2026-05-24 evening** —
+`scripts/extract/.venv-nemo` bootstrap finished cleanly. Verified packages
+in the venv:
 
-  - pip install torch + torchvision from `https://download.pytorch.org/whl/cu128`
-    (~2.5 GB)
-  - pip install -r `scripts/extract/requirements-nemo.txt` (transformers,
-    accelerate, open_clip_torch, albumentations, einops, pymupdf, pillow)
-  - Final import check
+  - `torch 2.11.0+cu128` (Blackwell sm_120 ready)
+  - `torchvision 0.26.0+cu128`
+  - `transformers 5.9.0`, `accelerate 1.13.0`, `open_clip_torch 3.3.0`
+  - `albumentations 2.0.8`, `einops 0.8.2`, `pymupdf 1.27.2.3`, `pillow 12.2.0`
+  - `torch.cuda.is_available() == True` confirmed inside the venv
 
-Estimated 10-15 min from start. Output file (local-only, gone after harness
-cleanup):
-  `C:\Users\john_\AppData\Local\Temp\claude\d--Projects-local-llm\180f5385-97c6-404d-8697-b8ccc351bd80\tasks\bhe11dhv9.output`
+`.venv-nemo` is at `scripts/extract/.venv-nemo/` (gitignored). The Parse
+model weights have NOT been downloaded yet — that happens on first
+`AutoModel.from_pretrained()` call (first smoke-test or first
+extraction run), ~3.75 GB into `storage/nemo-parse/hf-cache/` (gitignored).
 
-If the file is gone in the new session (it will be), just run the bootstrap
-fresh via `.\scripts\extract-nemo.ps1 ieee-nemo-parse-tas` — the script
-handles the venv creation idempotently.
+So the next session can **skip step 4 (bootstrap) in the resumption
+sequence below** and go straight to step 5.
 
 **Container state at handoff:**
   - `chroma`, `rag-server`, `reranker`, `open-webui`: healthy, normal
@@ -111,12 +112,10 @@ git status --short
 #    (NOT required for extraction; skip until Phase 3a is done)
 wsl -e bash -lc "cd /mnt/d/Projects/local-llm && sudo docker compose start sd-webui"
 
-# 4. Smoke-test the in-process Parse on one PDF page
-#    (idempotent; finishes .venv-nemo bootstrap if not already done)
-.\scripts\extract-nemo.ps1 ieee-nemo-parse-tas
-# ^ First run takes ~10-15 min on a fresh machine for the venv + model
-#   download (~6 GB total). Will fail on "no PDFs" if the data dir isn't
-#   prepared yet -- see step 5.
+# 4. ~~Bootstrap .venv-nemo~~ DONE 2026-05-24 (~6 GB torch/transformers/deps).
+#    `scripts/extract/.venv-nemo` already exists and imports cleanly. Parse
+#    model weights still need their first-call download (~3.75 GB) -- happens
+#    automatically on the first AutoModel.from_pretrained() call in step 6.
 
 # 5. Set up the parallel collection for Phase 3a
 #    (single PDF, to validate end-to-end before doing the full IEEE corpus)

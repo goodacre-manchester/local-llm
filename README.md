@@ -1,6 +1,14 @@
 # Local LLM Stack (WSL + Docker)
 
-This project runs a local LLM and PDF RAG stack on WSL with Docker.
+This project runs a local LLM and PDF RAG stack on WSL with Docker. The
+production configuration uses **Nemotron-3-Nano 30B-A3B** for the `!deep`
+generation profile and **NVIDIA Nemotron Parse v1.2** for IEEE-standards
+PDF extraction (the AMD collection still uses the lighter PyMuPDF4LLM
+backend). Both choices come from the 2026-05 retrieval eval — see
+[scripts/benchmark/BENCHMARK-RESULTS.md](scripts/benchmark/BENCHMARK-RESULTS.md)
+for the per-phase comparison + rationale, and
+[NEXT-STEPS-NEMOTRON-EVAL.md](NEXT-STEPS-NEMOTRON-EVAL.md) for the
+eval-side resumption notes.
 
 ## Services and URLs
 
@@ -80,17 +88,19 @@ wsl -e bash -lc "sudo docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Port
 
 Models pulled by default:
 
-- `llama3.1:8b-instruct-q8_0`
-- `qwen2.5-coder:32b-instruct-q4_K_M` (current `CHAT_MODEL_DEEP` default)
-- `deepseek-r1:14b`
-- `gemma4:e4b`  (Google Gemma 4 edge, ~9.6GB — fits 16GB VRAM fully; current `CHAT_MODEL` default)
-- `gemma4:26b`  (Gemma 4 MoE, ~18GB — 4B active params/token; CPU-offloads on 16GB)
-- `qwen3.6:27b` (Qwen 3.6 dense, Apr 2026, Apache 2.0; ~17GB at Q4_K_M, minor 16GB spillover; hybrid-thinking, 256K-1M context)
-- `qwen3.6:35b-a3b` (Qwen 3.6 MoE, 35B total / 3B active per token; ~24GB at Q4_K_M, partial spillover but MoE keeps inference fast)
-- `nemotron-3-nano:30b-a3b-q4_K_M` (NVIDIA Nemotron 3 Nano, nemotron_h_moe hybrid Transformer-Mamba MoE, 31.6B / 3B active, reasoning-tuned; ~24GB, partial spillover)
+- `gemma4:e4b`  (Google Gemma 4 edge, ~9.6GB — fits 16GB VRAM fully; current `CHAT_MODEL` default — fast profile)
+- `nemotron-3-nano:30b-a3b-q4_K_M` (NVIDIA Nemotron 3 Nano, nemotron_h_moe hybrid Transformer-Mamba MoE, 31.6B / 3B active per token, reasoning-tuned; ~24GB at Q4_K_M, partial spillover on 16GB cards; **current `CHAT_MODEL_DEEP` default** — promoted 2026-05 after the eval showed −24% median latency vs the previous dense 32B at comparable answer quality)
 - `nomic-embed-text` (embedding model used by the RAG server)
 
-The newer Qwen 3.6 and Nemotron 3 Nano models are not wired into the default `CHAT_MODEL` / `CHAT_MODEL_DEEP` env vars in `docker-compose.yml` — they're available via the existing per-request `<collection>!<ollama:tag>` literal-override syntax (e.g. `ieee!qwen3.6:35b-a3b` in the OpenAI `model` field) so you can A/B test without changing defaults. Promote to default by editing `CHAT_MODEL_DEEP` in `docker-compose.yml` and `docker compose up -d rag-server`.
+Optional models for direct chat (not wired into the RAG hot path; useful in Open WebUI's selector for general chat / code-gen outside the `<collection>` flow):
+
+- `llama3.1:8b-instruct-q8_0`
+- `deepseek-r1:14b` (reasoning-tuned, mid-weight)
+- `gemma4:26b` (Gemma 4 MoE, ~18GB — 4B active params/token; CPU-offloads on 16GB)
+- `qwen3.6:27b` (Qwen 3.6 dense, Apr 2026, Apache 2.0; ~17GB at Q4_K_M; hybrid-thinking, 256K-1M context)
+- `qwen3.6:35b-a3b` (Qwen 3.6 MoE, 35B total / 3B active per token; ~24GB at Q4_K_M, partial spillover)
+
+The eval found Qwen 3.6 unviable as a RAG `!deep` default on 16GB VRAM (>700s/prompt; MoE compute on partial CPU-spill is the bottleneck) — they're kept around for direct chat where the wait is acceptable, but the RAG default landed on Nemotron-3-Nano. Any of the optional models can still be invoked per-request via the literal-override syntax: `ieee!qwen3.6:35b-a3b` in the OpenAI `model` field, `query_pdfs` MCP tool's `profile` arg, etc.
 
 ### Generation model & answer tuning
 
@@ -98,10 +108,13 @@ The newer Qwen 3.6 and Nemotron 3 Nano models are not wired into the default `CH
 
 - **fast** (`CHAT_MODEL`, default `gemma4:e4b`) — GPU-resident, ~50 s,
   honest about doc gaps. Used when the model field has no suffix.
-- **deep** (`CHAT_MODEL_DEEP`, default `qwen2.5-coder:32b`) — best accuracy
-  on hard technical questions, ~5 min (CPU-offloaded). Request it by
-  appending `!deep` to the collection: `amd!deep`, `ieee!deep`,
-  `rag-active!deep`.
+- **deep** (`CHAT_MODEL_DEEP`, default `nemotron-3-nano:30b-a3b-q4_K_M`) — best
+  accuracy on hard technical questions. MoE 3B-active / 30B-total, ~24 GB
+  at Q4_K_M with ~8 GB system-RAM spillover on 16 GB cards. ~2-3 min per
+  deep query — about **24% faster than the previous `qwen2.5-coder:32b`
+  default** at comparable quality (the active-params advantage offsets the
+  spill penalty). Request it by appending `!deep` to the collection:
+  `amd!deep`, `ieee!deep`, `rag-active!deep`.
 
 In Open WebUI the model picker lists both per collection (e.g. `amd` and
 `amd!deep`). Via the API set `"model": "amd!deep"`. Via the MCP
@@ -128,24 +141,33 @@ Other answer knobs (see `.env.example` / design.md §5.1, §5.3):
 
 After exhaustive local tuning (structure-aware chunking, hybrid retrieval,
 dedupe + canonical preference, cross-encoder reranker, bookmark clause-path
-metadata, clause-bounded chunking, deep 32B model, multi-query expansion —
-all live), one failure class remains: **contrastive standards questions**
-where vocabulary collisions starve first-stage retrieval. Concretely, IEEE
-802.1Q TAS vs PSFP vs ATS: a question phrased around "PSFP stream gate / IPV"
-never recalls the TAS-defining `§12.29 Gate Parameter Table` / `§8.6.9
-Scheduled traffic` chunks, because resolving the disambiguation requires
-*knowing* that TAS ⇒ scheduled-traffic / Qbv / Clause 12.29 — domain
-knowledge the local generation **and** query-expansion models don't reliably
-have. NotebookLM/Gemini gets this class right because Gemini has that
-knowledge plus very large context. See [NEXT-STEPS.md](NEXT-STEPS.md) and
-design.md §5.4 for the full evidence trail and the planned implementation.
+metadata, clause-bounded chunking, deep MoE generation, multi-query expansion,
+Nemotron Parse extraction) **one failure class still remains**: contrastive
+standards questions where vocabulary collisions starve first-stage retrieval.
+Concretely, the `tas-vs-psfp-1` benchmark prompt — phrased around "PSFP
+stream gate / IPV" — never recalls the TAS-defining `§12.29` / `§8.6.9`
+chunks, because resolving the disambiguation requires *knowing* that
+TAS ⇒ scheduled-traffic / Qbv / Clause 12.29 — domain knowledge the local
+generation **and** query-expansion models don't reliably have.
+
+The 2026-05 eval explicitly tested swapping the local retrieval components
+to NVIDIA's `llama-nemotron-embed-vl-1b-v2` + `rerank-1b-v2`. Result:
+**rejected** — the multimodal embedder lost cross-chapter recall on this
+corpus and the rerank correctly deprioritised the `§12.29.1` config-tables
+chunk for the broader question, regressing the benchmark vs the
+nomic-embed + bge-reranker baseline. See `scripts/benchmark/BENCHMARK-RESULTS.md`
+for the full per-phase comparison. NotebookLM/Gemini still gets this class
+right because Gemini has the domain knowledge plus very large context; the
+Gemini `!deep` hybrid remains the planned next step. See
+[NEXT-STEPS.md](NEXT-STEPS.md) and design.md §5.4 for the full evidence
+trail and the planned implementation.
 
 **Planned design** (uses the existing switchable `!profile` architecture):
 
 | Profile | Backend | Privacy | Cost | Use |
 |---|---|---|---|---|
 | `ieee` (fast, default) | **local `gemma4:e4b`** | fully private | free | everyday, lookups |
-| `ieee!deep` | **Gemini paid key** (e.g. 2.x Pro) | no-training data terms | per-token | hard contrastive questions |
+| `ieee!deep` | local Nemotron-3-Nano (current) → **Gemini paid key** (planned, e.g. 2.x Pro) | local Nemotron: fully private. Gemini: no-training data terms | local: free / Gemini: per-token | local Nemotron handles most deep questions; Gemini reserved for the residual contrastive failure class (e.g. `tas-vs-psfp-1`) |
 | `ieee!gflash` (optional) | **Gemini free-tier key** (Flash) | **used by Google for improvement — not private** | free (rate-limited) | zero-cost trialing only |
 
 Local retrieval / embeddings / Chroma / grounding / citations stay on-box;
@@ -502,27 +524,54 @@ Each chunk's section is taken from the PDF's **bookmark/outline tree** (the
 authoritative clause structure, e.g. `12.29.1 The Gate Parameter Table`),
 not heuristic heading detection — this both makes citations clause-exact and
 lets retrieval separate mechanisms that share vocabulary but live in
-different clauses. Re-run `extract-pdfs.ps1 -Force` after changing
-`extract.py` (PDFs unchanged but logic changed); plain re-run skips unchanged
-files by source mtime.
+different clauses.
 
+**Two extraction backends are supported**, chosen per collection:
+
+| Backend | Script | Cost | Use for |
+|---|---|---|---|
+| PyMuPDF4LLM (default) | `extract-pdfs.ps1` | CPU only, seconds per PDF | Datasheets / general PDFs (e.g. AMD collection). Lightweight pure-Python venv at `scripts/extract/.venv`. |
+| **NVIDIA Nemotron Parse v1.2** (recommended for layout-heavy standards PDFs) | `extract-nemo.ps1` | GPU, ~10 s/page warm | **IEEE 802.1 standards collection.** Vision-encoder layout-aware extraction — produces cleaner section-bounded chunks. +2 fixes vs PyMuPDF4LLM on the RAG benchmark (`tas-vs-psfp-2`, `clause-explicit`), 0 regressions. Heavier venv at `scripts/extract/.venv-nemo` (torch cu128 + transformers + ~6 GB pip footprint). |
+
+PyMuPDF4LLM (any collection):
 ```powershell
 .\scripts\extract-pdfs.ps1            # all collections
 .\scripts\extract-pdfs.ps1 amd        # one collection
 .\scripts\extract-pdfs.ps1 amd -Force # re-extract even if unchanged
 ```
 
-First run creates a venv under `scripts/extract/.venv` and installs the
-lightweight backend (`pymupdf4llm`). This needs the WSL `python3-venv`
-package once:
+Nemotron Parse (`ieee` in this repo's reference config):
+```powershell
+.\scripts\extract-nemo.ps1 ieee                       # full IEEE corpus (~hours)
+.\scripts\extract-nemo.ps1 ieee -Force                # re-extract even if unchanged
+$env:NEMO_PARSE_PAGES = "203-238,480-482"             # slice extraction (per-PDF page ranges)
+.\scripts\extract-nemo.ps1 ieee-nemo-parse-tas        # extract just that slice
+Remove-Item Env:NEMO_PARSE_PAGES
+```
 
+Both scripts skip unchanged PDFs by source mtime; `-Force` re-extracts.
+Sidecar shape is identical between backends (`backend` field differs:
+`"pymupdf4llm"` vs `"nemotron-parse-v1.2"`); `app/server.js`'s
+`loadSidecar` / `chunkBlocks` consume both interchangeably, so you can
+mix backends across collections without rag-server code changes.
+
+First run of `extract-pdfs.ps1` creates `scripts/extract/.venv` and
+installs PyMuPDF4LLM. Needs `python3-venv` in WSL once:
 ```powershell
 wsl -e bash -lc "sudo apt-get install -y python3-venv"
 ```
 
-For best quality on dense datasheets, also `pip install docling` into that
-venv — `extract.py` picks it up automatically. Re-run after adding or
-changing PDFs (unchanged files skip).
+First run of `extract-nemo.ps1` creates `scripts/extract/.venv-nemo` and
+installs torch 2.x+cu128 (Blackwell sm_120 ready) + transformers +
+open_clip_torch + albumentations (~6 GB). Also downloads Parse model
+weights (~3.75 GB) into `storage/nemo-parse/hf-cache/` on first
+extraction call. Free the GPU first if other services are using it
+(`sudo docker compose stop sd-webui` — Parse + SDXL can't co-resident
+on 16 GB).
+
+For best quality on dense datasheets via the PyMuPDF4LLM path, also
+`pip install docling` into `.venv` — `extract.py` picks it up
+automatically.
 
 ### 3. Ingest a collection
 
@@ -679,3 +728,18 @@ Check health of all containers:
 ```powershell
 wsl -e bash -lc "sudo docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'"
 ```
+
+Start the Nemotron embed+rerank sidecar (host-side, manual — only for
+re-benching the Phase 4 retrieval components against a future Nemotron
+release; not part of the production hot path):
+
+```powershell
+wsl -e bash -lc "cd /mnt/d/Projects/local-llm/scripts/extract && \
+  . .venv-nemo/bin/activate && \
+  export HF_HOME=/mnt/d/Projects/local-llm/storage/nemo-parse/hf-cache && \
+  python /mnt/d/Projects/local-llm/scripts/nemo-rag/server.py"
+```
+
+Then opt a collection in via `NEMO_EMBED_COLLECTIONS` / `NEMO_RERANK_COLLECTIONS`
+in `docker-compose.yml` and recreate `rag-server`. See
+`scripts/benchmark/BENCHMARK-RESULTS.md` for the resumption procedure.

@@ -37,7 +37,14 @@ services:
       - EMBEDDING_MODEL=nomic-embed-text
       # Fast default + opt-in deep (request "<collection>!deep"). See §5.3.
       - CHAT_MODEL=gemma4:e4b
-      - CHAT_MODEL_DEEP=qwen2.5-coder:32b-instruct-q4_K_M
+      # 2026-05-25: promoted from qwen2.5-coder:32b-instruct-q4_K_M per the
+      # Nemotron RAG eval (scripts/benchmark/BENCHMARK-RESULTS.md, Phase 2).
+      # MoE 3B active params → ~−24% median latency vs the old dense 32B at
+      # comparable answer quality, and +1 fix on axi-intc-register when also
+      # promoted to CHAT_MODEL (not done — keeps gemma4:e4b's fast-profile
+      # snappiness). Q4_K_M is ~24 GB → ~16 GB GPU + ~8 GB system-RAM spill
+      # on 16 GB cards. `ollama pull nemotron-3-nano:30b-a3b-q4_K_M` to seed.
+      - CHAT_MODEL_DEEP=nemotron-3-nano:30b-a3b-q4_K_M
       - CHUNK_SIZE=1000
       - CHUNK_OVERLAP=200
       - CHUNK_CLAUSE_DEPTH=3
@@ -67,13 +74,18 @@ services:
       #     export HF_HOME=/mnt/d/Projects/local-llm/storage/nemo-parse/hf-cache && \
       #     python /mnt/d/Projects/local-llm/scripts/nemo-rag/server.py"
       - NEMO_RAG_URL=http://127.0.0.1:8009
-      # Per-feature opt-in lists. Full Nemotron (embed+rerank) regressed
-      # vs Phase 3a because the multimodal embed lost cross-chapter recall;
-      # Phase 4b keeps nomic-embed for first-stage and only routes rerank to
-      # Nemotron (where the in-isolation smoke gave +28 score advantage on
-      # the §12.29 contrast).
-      - NEMO_EMBED_COLLECTIONS=ieee-nemo-rag-tas
-      - NEMO_RERANK_COLLECTIONS=ieee-nemo-rag-tas,ieee-nemo-rerank-tas
+      # Per-feature opt-in lists for the Nemotron embed/rerank sidecar.
+      # Empty by default after the 2026-05-25 cleanup: the full Nemotron RAG
+      # path regressed `tas-vs-psfp-2` in both Phase 4 (embed+rerank) and
+      # Phase 4b (rerank-only) configurations -- the rerank correctly
+      # deprioritises §12.29.1 ("managed objects" config tables) for broader
+      # semantic questions, kicking it out of top-15 (bge-reranker's looser
+      # ordering let it just barely land at #15). See
+      # scripts/benchmark/BENCHMARK-RESULTS.md. Variable lines kept so the
+      # wire is discoverable for a future re-bench (e.g. a Nemotron release
+      # with a text-only embedder like llama-embed-nemotron-8b).
+      - NEMO_EMBED_COLLECTIONS=
+      - NEMO_RERANK_COLLECTIONS=
     command: >
       sh -lc "npm install && node server.js"
     depends_on:
@@ -235,21 +247,32 @@ services:
       # configs — easily 10 minutes on a fresh host. Don't fail before that.
       start_period: 900s
 
-  # Nemotron Parse v1.2 (NVIDIA) — vision-encoder-decoder document parser
-  # used by the Phase 3 RAG benchmark evaluation. NOT part of the autostart
-  # chain: omitted from `restart` policy intentionally so it only runs when
-  # explicitly brought up for an extraction job (`docker compose up -d
-  # nemo-parse`). Heavy GPU + first-boot — bring down when not in use.
+  # Nemotron Parse v1.2 (NVIDIA) — vision-encoder-decoder document parser.
   #
-  # Architecture: ViT-H encoder + mBart decoder (<1B params). Takes rendered
-  # page images (PNG/JPEG, 1024x1280 min, 2048x1664 standard) via vLLM's
-  # OpenAI-compat chat completions API with image_url content; returns
-  # markdown + bbox + class metadata for downstream postprocessing.
+  # *** DEPRECATED — not the active extraction path. ***
+  # Kept in compose with no autostart for documentation + future revival.
+  # The 2026-05 Nemotron eval found vLLM's chat-completions API does NOT
+  # apply Parse's bundled GenerationConfig (verified v0.14.1 + v0.21.0,
+  # both produced token-collapse output). The live extractor at
+  # `scripts/extract/extract-nemo.py` instead loads Parse via in-process
+  # HF transformers (`AutoModel.from_pretrained(..., trust_remote_code=True)
+  # + GenerationConfig.from_pretrained(...) + model.generate()`) inside
+  # the host-side `scripts/extract/.venv-nemo` Python venv. That path
+  # produces stable output and is what scripts/extract-nemo.ps1 invokes.
   #
-  # Used by scripts/extract/extract-nemo.py to produce sidecar JSON in the
-  # same shape as scripts/extract/extract.py (PyMuPDF4LLM backend) so
-  # app/server.js's existing loadSidecar/chunkBlocks paths consume both
-  # interchangeably. See plan: ~/.claude/plans/concurrent-scribbling-cocke.md
+  # Revival gate: a vLLM release that fixes multimodal generation_config
+  # wiring. Until then `docker compose up -d nemo-parse` is intentionally
+  # not a supported operation. Sidecar shape (`backend="nemotron-parse-v1.2"`,
+  # same blocks schema as PyMuPDF4LLM extraction) is consumed identically
+  # by app/server.js's loadSidecar/chunkBlocks pipeline, so once revived
+  # this service would be a drop-in re-attempt.
+  #
+  # Architecture (for reference): ViT-H encoder + mBart decoder (<1B params).
+  # Takes rendered page images (PNG/JPEG, 1024x1280 min, 2048x1664 standard);
+  # returns markdown + bbox + class metadata for downstream postprocessing.
+  #
+  # Eval write-up: scripts/benchmark/BENCHMARK-RESULTS.md
+  # Plan:          ~/.claude/plans/concurrent-scribbling-cocke.md
   nemo-parse:
     image: vllm/vllm-openai:v0.21.0-cu129-ubuntu2404
     container_name: local-llm-nemo-parse

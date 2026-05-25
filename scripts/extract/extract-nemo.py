@@ -169,7 +169,137 @@ def _clean_parse_md(raw: str) -> str:
     return cleaned
 
 
-def _extract_nemotron_parse(pdf: Path) -> list[dict]:
+# ─── Picture-block extraction (Phase H + F prerequisite) ──────────────
+#
+# Parse v1.2 tags every layout block as
+#     <x_x1><y_y1>CONTENT<x_x2><y_y2><class_CLASS>
+# where (x1,y1)-(x2,y2) is the normalised bbox and CLASS is one of
+# Text, Section-header, Caption, Picture, Page-header, Page-footer,
+# Footnote, List-item. The existing _clean_parse_md strips all of this
+# so the downstream markdown parser sees clean prose. But for picture
+# blocks we WANT the bbox preserved so we can:
+#   1. Rasterise the picture region from the source PDF to a persistent
+#      PNG (so a future re-captioning run can swap the VLM without
+#      re-running Parse OR re-rasterising).
+#   2. Pair each picture with its caption (the Caption-class block
+#      directly below it) for use as Phase F prompt context.
+#   3. Emit a type:"picture" block alongside text blocks so downstream
+#      consumers (rag-server chunk ingest, dump-sidecar-md renderer)
+#      can treat pictures as first-class content.
+
+_BLOCK_RE = re.compile(
+    r"<x_(?P<x1>[\d.]+)><y_(?P<y1>[\d.]+)>"
+    r"(?P<content>.*?)"
+    r"<x_(?P<x2>[\d.]+)><y_(?P<y2>[\d.]+)>"
+    r"<class_(?P<cls>[A-Za-z0-9_-]+)>",
+    flags=re.DOTALL,
+)
+
+
+def _parse_raw_blocks(raw: str) -> list[dict]:
+    """Parse Parse's raw markdown into structured per-block records.
+    Each record: {bbox, cls, content, span} where span is the (start,end)
+    char offset of the match in raw — used later by _strip_consumed_spans
+    to remove picture + paired-caption regions before text extraction so
+    captions don't duplicate."""
+    out: list[dict] = []
+    for m in _BLOCK_RE.finditer(raw):
+        out.append({
+            "bbox": [float(m["x1"]), float(m["y1"]),
+                     float(m["x2"]), float(m["y2"])],
+            "cls": m["cls"],
+            "content": m["content"],
+            "span": (m.start(), m.end()),
+        })
+    return out
+
+
+def _strip_consumed_spans(raw: str, consumed_match_keys: set[tuple[int, int]]) -> str:
+    """Re-walk `raw` with _BLOCK_RE and replace any block whose match
+    span is in `consumed_match_keys` with an empty string. Used to
+    remove picture + caption regions from the raw markdown after they've
+    been consumed as picture-block metadata, so the same caption text
+    doesn't ALSO show up as a duplicate paragraph from _md_page_to_blocks."""
+    pieces: list[str] = []
+    last = 0
+    for m in _BLOCK_RE.finditer(raw):
+        if (m.start(), m.end()) in consumed_match_keys:
+            pieces.append(raw[last:m.start()])
+            last = m.end()
+    pieces.append(raw[last:])
+    return "".join(pieces)
+
+
+def _pair_picture_captions(parsed: list[dict]) -> tuple[list[dict], set[tuple[int, int]]]:
+    """For each Picture block, concatenate ALL Caption blocks within
+    15% of page height below it (and with x-overlap > 50%). Multiple
+    captions per picture are common — a Figure 6-2 may have:
+      1. an abbreviation legend ("LSAP - Link service access point")
+      2. the formal title ("**Figure 6-2--Relationship between ...**")
+    Picking just the closest can pick the legend over the title; this
+    concatenates them in document order (top-to-bottom) so both end up
+    in the caption field and the VLM has the full label context.
+
+    Returns (pictures_with_captions, consumed_spans) where consumed_spans
+    is the set of (start, end) match offsets in raw that should be
+    stripped from the markdown before text extraction — so consumed
+    captions don't duplicate as standalone paragraphs.
+
+    Y-gap threshold: empirical from the 2026-05-26 probe — well-formed
+    figure-title captions sit ~1-3% below the picture bottom; with a
+    legend stacked between, the second caption can be at +5-8%. 15% is
+    generous enough to catch multi-row labels.
+    """
+    pictures = [b for b in parsed if b["cls"] == "Picture"]
+    captions = [b for b in parsed if b["cls"] == "Caption"]
+    consumed: set[tuple[int, int]] = set()
+    for pic in pictures:
+        consumed.add(pic["span"])
+        pic_bottom = pic["bbox"][3]
+        pic_left, pic_right = pic["bbox"][0], pic["bbox"][2]
+        matched: list[tuple[float, dict]] = []
+        for cap in captions:
+            cap_top = cap["bbox"][1]
+            if cap_top < pic_bottom:
+                continue
+            gap = cap_top - pic_bottom
+            if gap > 0.15:
+                continue
+            cap_left, cap_right = cap["bbox"][0], cap["bbox"][2]
+            overlap = min(pic_right, cap_right) - max(pic_left, cap_left)
+            cap_width = cap_right - cap_left
+            if cap_width <= 0 or overlap / cap_width < 0.5:
+                continue
+            matched.append((cap_top, cap))
+        matched.sort()
+        pic["caption"] = "\n\n".join(
+            c["content"].strip() for _, c in matched if c["content"].strip()
+        )
+        for _, c in matched:
+            consumed.add(c["span"])
+    return pictures, consumed
+
+
+def _rasterise_bbox(page: fitz.Page, bbox: list[float],
+                    target_long_side: int = TARGET_PX) -> bytes:
+    """Render the bbox-cropped region of `page` to PNG. bbox is in
+    Parse's normalised 0-1 coordinates. Render zoom matches the full-
+    page Parse render so figure detail (annotations, axis labels) stays
+    readable for the VLM."""
+    r = page.rect
+    longer = max(r.width, r.height)
+    if longer <= 0:
+        return b""
+    zoom = target_long_side / longer
+    x1, y1, x2, y2 = bbox
+    clip = fitz.Rect(x1 * r.width, y1 * r.height,
+                     x2 * r.width, y2 * r.height)
+    pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom),
+                          clip=clip, alpha=False)
+    return pix.tobytes("png")
+
+
+def _extract_nemotron_parse(pdf: Path, images_dir: Path | None = None) -> list[dict]:
     section_state = {"current": ""}
     blocks: list[dict] = []
     doc = fitz.open(str(pdf))
@@ -180,6 +310,7 @@ def _extract_nemotron_parse(pdf: Path) -> list[dict]:
               f"{len(PAGE_FILTER)} of {n_pages} pages will be processed", flush=True)
 
     page_errors = 0
+    total_pictures = 0
     for i in range(n_pages):
         page_no = i + 1
         if PAGE_FILTER is not None and page_no not in PAGE_FILTER:
@@ -189,12 +320,66 @@ def _extract_nemotron_parse(pdf: Path) -> list[dict]:
             if not png:
                 continue
             raw = _parse_image(png)
-            cleaned = _clean_parse_md(raw)
         except Exception as exc:
             page_errors += 1
             print(f"    page {page_no}: ERROR {exc}", flush=True)
             continue
 
+        # Picture extraction: pulled from raw (pre-cleaning) markdown.
+        # Emit BEFORE text blocks per page so the figure appears at the
+        # top of its page in the rendered .md (text references usually
+        # come below). Inside Chroma the relative ordering doesn't matter
+        # — chunkBlocks groups by clauseKey + size, not position.
+        #
+        # When images_dir is provided, also remove the picture + paired-
+        # caption regions from the raw markdown before text extraction
+        # so the same caption text doesn't show up as a duplicate
+        # paragraph in the .md preview AND a duplicate chunk in Chroma.
+        consumed_spans: set[tuple[int, int]] = set()
+        if images_dir is not None:
+            try:
+                parsed = _parse_raw_blocks(raw)
+                pictures, consumed_spans = _pair_picture_captions(parsed)
+                for pic_idx, pic in enumerate(pictures, 1):
+                    try:
+                        png_bytes = _rasterise_bbox(doc[i], pic["bbox"])
+                    except Exception as raster_exc:
+                        print(f"    page {page_no} pic{pic_idx}: rasterise "
+                              f"failed: {raster_exc}", flush=True)
+                        continue
+                    pdf_img_dir = images_dir / pdf.stem
+                    pdf_img_dir.mkdir(parents=True, exist_ok=True)
+                    img_file = pdf_img_dir / f"p{page_no}-pic{pic_idx}.png"
+                    img_file.write_bytes(png_bytes)
+                    rel_path = img_file.relative_to(images_dir.parent).as_posix()
+                    caption_txt = pic.get("caption", "")
+                    blocks.append({
+                        "id": f"p{page_no}-pic{pic_idx}",
+                        "page": page_no,
+                        "section": section_state.get("current", ""),
+                        "type": "picture",
+                        "bbox": pic["bbox"],
+                        "caption": caption_txt,
+                        "image_path": rel_path,
+                        # `text` = caption initially so the block is
+                        # searchable on the figure title from the moment
+                        # Phase H lands. caption-images.py will append
+                        # the VLM description later.
+                        "text": caption_txt,
+                        "vlm_description": "",
+                    })
+                    total_pictures += 1
+            except Exception as exc:
+                print(f"    page {page_no}: picture extraction failed: {exc}",
+                      flush=True)
+
+        # Strip consumed picture+caption spans from raw BEFORE cleaning
+        # so they don't double up as text blocks.
+        if consumed_spans:
+            raw_for_text = _strip_consumed_spans(raw, consumed_spans)
+        else:
+            raw_for_text = raw
+        cleaned = _clean_parse_md(raw_for_text)
         blocks.extend(_md_page_to_blocks(cleaned, page_no, section_state))
 
         if page_no % 25 == 0 or page_no == n_pages:
@@ -204,6 +389,9 @@ def _extract_nemotron_parse(pdf: Path) -> list[dict]:
 
     if page_errors:
         print(f"    WARNING: {page_errors}/{n_pages} pages had extraction errors", flush=True)
+    if images_dir is not None and total_pictures:
+        print(f"    extracted {total_pictures} picture block(s) -> "
+              f"{images_dir.name}/{pdf.stem}/", flush=True)
     return blocks
 
 
@@ -235,6 +423,12 @@ def main(argv: list[str]):
         folder = data_dir / collection
         cache = folder / ".rag-cache"
         cache.mkdir(exist_ok=True)
+        # Per-collection persistent image cache. Pictures extracted from
+        # PDFs land here so caption-images.py (and any future re-captioning
+        # run with a different VLM) can iterate the persisted PNGs without
+        # re-running Parse.
+        images_dir = folder / ".rag-images"
+        images_dir.mkdir(exist_ok=True)
         # Skip *.txt.pdf — IETF RFCs and similar text-source PDFs.
         # Parse mis-converts ASCII-art packet diagrams into broken LaTeX
         # tabular fragments (see rfc4541 §IPv6-multicast-address-format
@@ -277,7 +471,7 @@ def main(argv: list[str]):
             print(f"[{collection}] extracting (nemotron-parse-v1.2, {size_mb:.1f}MB): "
                   f"{pdf.name}", flush=True)
             try:
-                blocks = _extract_nemotron_parse(pdf)
+                blocks = _extract_nemotron_parse(pdf, images_dir=images_dir)
                 blocks = _apply_toc(pdf, blocks)
             except Exception as exc:
                 print(f"[{collection}] ERROR on {pdf.name}: {exc}",

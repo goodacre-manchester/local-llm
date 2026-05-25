@@ -720,7 +720,10 @@ def _emit_block(block: dict, lines: list[str], state: dict) -> None:
     raw     = block.get("text") or ""
     text    = raw.rstrip() if btype == "code" else raw.strip()
 
-    if not text:
+    # Picture blocks are renderable even with empty `text` (no caption
+    # detected by Parse) — the image itself + bbox still warrant a
+    # placeholder + image link. Skip the early-return for them.
+    if not text and btype != "picture":
         return
 
     # Page boundary — invisible in rendered preview, jumpable in source view.
@@ -779,6 +782,36 @@ def _emit_block(block: dict, lines: list[str], state: dict) -> None:
         lines.append(text)
         lines.append("```")
         lines.append("")
+    elif btype == "picture":
+        # Phase H "(A) picture" block: a figure extracted by Parse with
+        # bbox + persisted PNG + optional VLM description. Renders as:
+        #   > <caption>           (blockquote, so it stands out vs prose)
+        #   ![](relative-path-to-png)
+        #   <vlm description (if filled)>
+        # The .md file lives in data/<collection>/.rag-md/; image_path
+        # is stored relative to data/<collection>/, so prepend `../`
+        # to make the link resolve from the .md location.
+        caption = (block.get("caption") or "").strip()
+        img_rel = (block.get("image_path") or "").strip()
+        desc = (block.get("vlm_description") or "").strip()
+        # Parse-extracted captions often have surrounding ** bold
+        # markers (e.g. "**Figure 6-1--LLDP agent...**") — these read
+        # awkwardly inside our own bold wrapping. Strip the outer
+        # markers if present; the caption text remains visible and
+        # bold-rendered by the blockquote anyway.
+        if caption.startswith("**") and caption.endswith("**"):
+            caption = caption[2:-2].strip()
+        # Multi-paragraph caption (legend + title) joins with `<br>` so
+        # markdown previewers render one logical line per caption.
+        caption_md = caption.replace("\n\n", "<br>") if caption else "(no caption detected)"
+        lines.append(f"> **Figure** — {caption_md}")
+        lines.append("")
+        if img_rel:
+            lines.append(f"![](../{img_rel})")
+            lines.append("")
+        if desc:
+            lines.append(desc)
+            lines.append("")
     else:
         # Paragraph. text already carries inline markdown (bold/sup/<br>) so
         # the preview renders it directly. If the block looks like ASN.1 /

@@ -157,13 +157,22 @@ _PAGE_MARKER = re.compile(r"^<!-- p\.\d+ -->$")
 def _normalize_chrome_line(s: str) -> str:
     """Aggressive normalization so trivially-varying page-header lines
     collapse to the same bucket: lowercase, unify dash variants, drop
-    all digits and trailing punctuation, collapse whitespace."""
+    all digits and trailing punctuation, collapse whitespace, then
+    truncate to a fixed prefix so tail variation (trailing copyright
+    text, roman-numeral page numbers, Parse hallucinations swapping
+    one word, etc.) doesn't fork the bucket."""
     s = s.lower()
-    s = re.sub(r"[—–\-]+", "-", s)         # unify Unicode dash variants
-    s = re.sub(r"\d+", "", s)                # drop digits (page nums, dates, IDs)
-    s = re.sub(r"\s+", " ", s).strip()       # collapse whitespace runs
-    s = s.strip("-.,;:|/ ")                  # strip trailing punctuation
-    return s
+    s = re.sub(r"[—–\-]+", "-", s)           # unify Unicode dash variants
+    s = re.sub(r"\d+", "", s)                  # drop digits (page nums, dates, IDs)
+    s = re.sub(r"\b[ivxlcdm]+\b", "", s)       # drop lowercase roman numerals
+    s = re.sub(r"\s+", " ", s).strip()         # collapse whitespace runs
+    s = s.strip("-.,;:|/ ")                    # strip leading/trailing punctuation
+    # Bucket by the first 60 chars of normalized form: this is enough to
+    # disambiguate different chrome types (publisher header vs license
+    # footer vs copyright) while collapsing intra-publisher variation
+    # ("manchester" vs "massachusetts" hallucination on different pages,
+    # comma vs period boundary punctuation, etc.).
+    return s[:60]
 
 
 def _detect_page_chrome(lines: list[str]) -> set[str]:
@@ -217,6 +226,40 @@ _LONG_RUN = re.compile(r"(.)\1{29,}")
 
 def _collapse_long_runs(text: str) -> str:
     return _LONG_RUN.sub(lambda m: m.group(1) * 20, text)
+
+
+def _strip_repeated_chrome(md: str, chrome_norms: set[str]) -> str:
+    """Keep the FIRST instance of each chrome line (page header / footer /
+    license attribution) so the reader sees the doc's attribution + copyright
+    information once near the top; strip subsequent occurrences so they
+    don't break prose flow on every page. `<!-- p.N -->` markers are NOT
+    chrome — they're our own navigation aid and pass through unchanged."""
+    if not chrome_norms:
+        return md
+    lines = md.split("\n")
+    seen: set[str] = set()
+    out: list[str] = []
+    for ln in lines:
+        s = ln.strip()
+        if not s or _PAGE_MARKER.match(s):
+            out.append(ln)
+            continue
+        norm = _normalize_chrome_line(s)
+        if norm in chrome_norms:
+            if norm in seen:
+                continue  # already kept once — drop this recurrence
+            seen.add(norm)
+        out.append(ln)
+    # Collapse any blank-line runs the strip-out left behind.
+    collapsed: list[str] = []
+    prev_blank = False
+    for ln in out:
+        is_blank = ln == ""
+        if is_blank and prev_blank:
+            continue
+        collapsed.append(ln)
+        prev_blank = is_blank
+    return "\n".join(collapsed)
 
 
 def _is_code_continuation_orphan(line: str) -> bool:
@@ -766,6 +809,11 @@ def render_sidecar(sidecar: dict) -> str:
     # Collapse long runs of identical characters (Parse-extracted ASCII-art
     # divider lines) so the preview doesn't horizontal-scroll forever.
     md = _collapse_long_runs(md)
+    # Drop recurring page header/footer chrome from prose — keep the first
+    # instance so attribution / license / copyright info is visible once
+    # near the top, but don't repeat it on every page.
+    chrome_norms = _detect_page_chrome(md.split("\n"))
+    md = _strip_repeated_chrome(md, chrome_norms)
     return md
 
 

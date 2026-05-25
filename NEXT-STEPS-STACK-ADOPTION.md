@@ -328,6 +328,17 @@ found three concrete Parse quality issues:
 
 **Phase H scope** (all in `scripts/extract/extract-nemo.py`):
 
+- **Preserve `<class_Picture>` markers + bbox info** for Phase F (image
+  captioning) insertion points. `_clean_parse_md()` currently strips
+  Parse's `<class_Picture>`, `<class_Figure>`, `<class_*>` and
+  `<x_..><y_..>` markers; without them Phase F has no anchor for where
+  to inject a caption and no bbox to crop the page region. Surfaced by
+  the 2026-05-25 8021AB-2016 audit: AB-2016 Figure 6-1 has no
+  placeholder in the sidecar because we threw it away. **Fix**: emit a
+  `type: "picture"` block with `bbox: {x0, y0, x1, y1}` + any text
+  Parse found inside the figure region. PyMuPDF4LLM-extracted sidecars
+  already have `==> picture [W x H] intentionally omitted <==`
+  placeholders for this purpose; Parse-extracted sidecars need parity.
 - **Per-page collapse-loop detection.** After generating each page,
   scan the output for excessive short-fragment repetition (e.g. > 30%
   of the cleaned text is a single ≤ 30-char substring repeated). If
@@ -342,7 +353,8 @@ found three concrete Parse quality issues:
   start. The renderer band-aided this by using clause-derived heading
   levels from heading text, but cleaner is to use Parse's bbox info to
   resolve `section` per-block-position. Requires preserving the
-  `<x_..><y_..>` markers `_clean_parse_md()` currently strips.
+  `<x_..><y_..>` markers `_clean_parse_md()` currently strips — same
+  preservation work as the picture-marker bullet above.
 - **ASN.1 indentation preservation** (optional / stretch goal). Drop a
   lightweight SMIv2 reformatter into `extract-nemo.py` so the JSON
   sidecar's `text` for MIB-content blocks carries proper indentation.

@@ -526,11 +526,33 @@ viable**, with two concrete unresolved questions:
 
 | Artefact | Location | Status |
 |---|---|---|
-| Smoke script | `scripts/extract/_smoke_vlm.py` | Committed; **both `v2` (locked-in default) and `cot` (experimental) prompts present**; selectable via 4th CLI arg; reads embedded PDF images, calls Ollama, prints captions |
-| Models pulled | `qwen3-vl:8b` (6.1 GB), `llama3.2-vision:11b` (7.8 GB) | Both in Ollama; llama3.2 underperforms so could be `ollama rm`'d to free disk |
-| `llama4:scout` | NOT pulled | Defer test until after Phase C completes (GPU constraints) |
-| Test PDFs used | `data/amd/pg099-axi-intc.pdf` (3 timing diagrams) | A/B'd v2 vs CoT 2026-05-25 — see CoT findings above; STILL insufficient diversity, need state-machine / block / register / packet diagrams |
+| Smoke script | `scripts/extract/_smoke_vlm.py` | Committed; both `v2` (default) and `cot` (experimental) prompts present; `start-page` CLI arg added 2026-05-25 |
+| **Production VLM** | **`qwen3-vl:8b`** (6.1 GB, qwen3 backbone) | **Confirmed best after alternative-model sweep 2026-05-25** — see below |
+| Alternatives tested + REJECTED | `MiniCPM-V 4.5`, `InternVL3.5-8B` (blaifa tag), `Granite 3.2 Vision`, `llama3.2-vision:11b` | All worse than qwen3-vl:8b on our specific failure modes — see "Alternative VLM sweep" section |
+| `llama4:scout` | NOT pulled | Defer test until after Phase C (needs 20-24 GB; doesn't fit alongside Parse) |
+| Test PDFs used | `pg099-axi-intc`, `8021AB-2016`, `pg047-gig-eth-pcs-pma`, `8021AS-2025` (survey) | 14 images smoked across 5 diagram types (timing, block, protocol, packet, state machine) — see findings in item 1 |
 | Production integration | NOT BUILT | Currently just a smoke harness; the real `caption-images.py` per the Phase F architecture sketch is still to come |
+
+### Alternative VLM sweep — 2026-05-25
+
+Researched and smoke-tested three alternatives to qwen3-vl:8b after the prompt-tuning exercise revealed the dominant failure modes (background-knowledge hallucination + framing leak) are model-side. Research agent recommended (in priority order): MiniCPM-V 4.5, InternVL3.5-8B, Granite 3.3 Vision 2B. **All three rejected**:
+
+| Model | Pull tag | Result | Why rejected |
+|---|---|---|---|
+| `MiniCPM-V 4.6` | `openbmb/minicpm-v4.6` | **Won't load** — Ollama 0.24.0 doesn't support its Qwen3.5 backbone yet. |
+| `MiniCPM-V 4.5` (8.2B, qwen3) | `openbmb/minicpm-v4.5` | **Catastrophic on dense diagrams.** Image 2 (LLDP block, p.27) ran 273s in a runaway repetition loop — same paragraph regenerated 100+ times. All outputs prefixed with `<think>` reasoning blocks (the model is a "thinking" model — adds framing rather than removing it). Outputs also include `### System Facts:` markdown headers. The "RLAIF-V trustworthiness training" claim doesn't address our failure modes. |
+| `InternVL3.5-8B` (8.19B, qwen3) | `blaifa/InternVL3_5:8b` (community tag) | **Tag has broken vision plumbing.** Sub-second latencies suggested skipping; content confirmed it — described an MDIO timing diagram as a MUSICAL SCORE ("melody and bass lines... whole notes, half notes, double bar line"), described a GTH transceiver block diagram as "L-C-U-2A 24V power supply with terminal block". Only one InternVL tag on Ollama and this is it. Would need HF transformers sidecar to test the real model — significant work, deferred. |
+| `Granite 3.2 Vision` (2.5B) | `granite3.2-vision` | **Worst hallucinator.** Invented acronym expansions wholesale: "DLE (Data Line Enable)", "PHYAD (Physical Address Decoder)" (actually PHY Address), "ST4 drives MDIO (Master-Slave Interface for Data Input/Output)" (actually Station Management Entity). On the GTH diagram: invented "microcontrollers (BUFG_GT), digital signal processors (DSPs), analog-to-digital converters (ADCs)" — BUFG_GT is a clock buffer; no DSPs or ADCs in the actual diagram. Heavy "The diagram is a schematic representation of..." framing leak. Note: tested 3.2; the agent recommended 3.3-vision:2b but the failure pattern (acronym invention) is likely intrinsic to small-model VLMs. |
+| `llama3.2-vision:11b` | (already had) | Already rejected pre-2026-05-25. Pervasive section-header leak, invented signals, timeouts. |
+
+**Key meta-finding from the sweep: general benchmarks don't predict our failure modes.** OCRBench / HallusionBench / ChartQA scores are useful but the agent's research weighted them too heavily. What actually matters for technical-spec captioning is whether the model invents component names and acronym expansions when uncertain — and on this metric, all four alternatives failed worse than qwen3-vl:8b. The qwen3-vl:8b failure mode is the smallest one we've seen.
+
+**Forward queue for VLM exploration** (in priority order, NOT BLOCKING):
+1. **llama4:scout** after Phase C completes — only untested candidate that fits the budget; larger model may have different hallucination pattern.
+2. **InternVL3.5-8B via HF transformers sidecar** — if Ollama tag breakage was the issue (not the model itself), running it native via HF could reveal whether the real model is competitive. Requires building a small Python sidecar like `scripts/nemo-rag/server.py`. Worth ~1-2 hours if llama4:scout also disappoints.
+3. **Qwen2.5-VL 7B / 32B** — agent dismissed as "same family pathologies" but worth a single smoke if everything else fails; cheap to pull.
+
+**Strong recommendation: stop optimising the model. Build the meta-stripper, then re-evaluate.** The framing-leak failure (~80% of bad outputs) is fixable in post; the hallucinated-component-name failure (~20% of bad outputs) is harder but smaller in volume. Meta-stripper has higher leverage than model swaps.
 
 ---
 

@@ -213,13 +213,28 @@ def main(argv: list[str]):
         folder = data_dir / collection
         cache = folder / ".rag-cache"
         cache.mkdir(exist_ok=True)
+        # Skip *.txt.pdf — IETF RFCs and similar text-source PDFs.
+        # Parse mis-converts ASCII-art packet diagrams into broken LaTeX
+        # tabular fragments (see rfc4541 §IPv6-multicast-address-format
+        # for the canonical failure). These files have no visual content
+        # that benefits from Parse; pymupdf4llm via extract.py handles
+        # them natively. If a non-RFC *.txt.pdf legitimately needs Parse
+        # in the future, add an opt-in flag — until then, the skip is
+        # unambiguous and worth more than the flexibility.
         pdfs = sorted(
             (p for p in folder.iterdir()
-             if p.is_file() and p.suffix.lower() == ".pdf"),
+             if p.is_file() and p.suffix.lower() == ".pdf"
+             and not p.name.lower().endswith(".txt.pdf")),
             key=lambda p: p.stat().st_size,
         )
+        skipped_txt = sorted(
+            p.name for p in folder.iterdir()
+            if p.is_file() and p.name.lower().endswith(".txt.pdf")
+        )
+        for s in skipped_txt:
+            print(f"[{collection}] skip (.txt.pdf, use extract.py): {s}", flush=True)
         if not pdfs:
-            print(f"[{collection}] no PDFs")
+            print(f"[{collection}] no PDFs (after .txt.pdf filter)")
             continue
 
         for pdf in pdfs:

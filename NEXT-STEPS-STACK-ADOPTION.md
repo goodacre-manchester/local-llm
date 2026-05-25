@@ -301,58 +301,179 @@ register-layout figure) and judge whether the caption quality is worth
 the GPU+wall-clock cost. If quality is mediocre, defer further or pick
 a different VLM.
 
-### VLM captioning prompt (user-developed, 2026-05-25)
+### VLM captioning prompt (user-developed, iterated 2026-05-25)
 
-The prompt below is the canonical instruction to pass to the VLM
-alongside each cropped figure. User-developed via experimentation;
-verified to produce RAG-friendly propositional captions rather than
-the visual-description captions VLMs default to.
+The prompt below is the **current locked-in version** (iteration v2 after
+v3 with DO/DON'T examples backfired — see iteration history below).
+Tested on `qwen3-vl:8b` against 3 timing diagrams from
+`pg099-axi-intc.pdf`; produces RAG-friendly propositional captions on
+~2/3 of outputs with some residual meta-commentary on more complex
+images.
 
 ```
 This is a technical diagram from a specification or reference document.
 State only what the diagram is asserting — the facts, relationships,
-scopes, and constraints it is communicating. Do not describe how the
-diagram is drawn, its visual structure, arrows, layout, or spatial
-arrangement. Do not augment with background knowledge. If a component
-is labelled but its role is not explicitly stated, name it without
-interpreting it. Write only the assertions the diagram makes, as a
-set of factual statements about the subject matter.
+scopes, and constraints it is communicating.
+
+Do not describe how the diagram is drawn, its visual structure, arrows,
+layout, spatial arrangement, or visual annotations (reference lines,
+dashed lines, grid lines, axes, color coding). Do not augment with
+background knowledge. If a component is labelled but its role is not
+explicitly stated, name it without interpreting it. If the diagram does
+not specify a precise value, state what it does specify rather than
+using vague placeholders.
+
+Output ONLY the factual statements the diagram makes. No introduction,
+no conclusion, no meta-commentary about "the diagram" itself. Begin
+with the first fact; end with the last.
 ```
 
-**Why this prompt works for RAG** (worth preserving the rationale so
-future iterations don't drift):
+**Why this prompt works** (preserved so future iterations don't drift):
 
 1. *Context anchor* (`"technical diagram from a specification..."`)
    tells the VLM the genre/register to use — formal, factual, not
    discursive.
 2. *Positive goal* (`"facts, relationships, scopes, constraints"`)
    constrains output to the propositional content that retrieval can
-   actually match queries against. Atomic facts are higher density
-   per chunk than narrative descriptions.
+   actually match queries against. Atomic facts are higher density per
+   chunk than narrative descriptions.
 3. *Negative suppression of visual description* kills the default VLM
    failure mode ("there is an arrow from box A to box B labelled X")
-   which produces text useless once retrieval surfaces the chunk in
-   a citation list.
+   which produces text useless once retrieval surfaces the chunk in a
+   citation list. v2 added explicit coverage of "reference lines,
+   dashed lines, grid lines, axes, color coding" after v1 leaked
+   "the red dashed vertical lines" through.
 4. *Anti-hallucination via "do not augment with background knowledge"*
-   keeps the caption grounded in the figure. Without it, VLMs reflexively
-   add "this is a typical TSN state machine following IEEE 802.1Q
-   convention..." from training data — polluting RAG with unverified
-   model-knowledge that should be answered from authoritative chunks
-   elsewhere in the corpus.
+   keeps the caption grounded in the figure rather than padding with
+   "this is a typical TSN state machine..." from training data.
 5. *Anti-hallucination via "name without interpreting"* prevents the
    second failure case where the VLM invents roles for labelled
    components ("the `CycleStart` counter increments at...").
-6. *Output format hint* (`"as a set of factual statements"`) shapes
-   the response into the form rag-server's chunker can split cleanly.
+6. *Anti-vague-placeholder* added in v2: when the diagram doesn't
+   specify a precise value, the model should say what IS specified, not
+   fall back on "at a specific time point" / "for a duration".
+7. *Anti-meta-commentary*: explicit "no introduction, no conclusion".
+   Partially effective on qwen3-vl:8b; the model retains some chat-
+   training reflex to wrap output in "The diagram asserts the
+   following..." openings on complex images.
 
-**Implementation note:** when picking a VLM, smoke-test this prompt
-against several diagram types (state machine, timing chart, register
-layout, packet format). Different VLMs (qwen2.5-vl, llava, gpt-4v,
-gemma3-vision) have different prompt-following reliability —
-particularly on the negative instructions ("do not describe how the
-diagram is drawn"). The prompt's value depends on the VLM actually
-respecting suppression; revisit if the chosen model hallucinates
-through it.
+### Iteration history + lessons learned (2026-05-25 smoke session)
+
+**v1** (original user-developed): worked on simple diagrams but two
+suppression leaks:
+  - Visual reference markers slipped through ("the red dashed vertical lines")
+  - ~1/3 of outputs had meta-commentary opening ("The diagram asserts
+    the following facts and timing relationships...")
+
+**v2** (current): added explicit visual-annotation list (reference
+lines, dashed lines, grid lines, axes, color coding); added "if the
+diagram does not specify a precise value, state what it does specify";
+added "no introduction, no conclusion, no meta-commentary about 'the
+diagram' itself". Result on qwen3-vl:8b: color-reference leak fixed;
+some meta-commentary still appears on complex images.
+
+**v3** (DO/DON'T few-shot examples): BACKFIRED. Added explicit
+examples of DO write and DO NOT write. The model **parroted the
+DON'T examples back as the output's opening** ("The diagram shows the
+behavior of several signals over time..."). Known LLM failure mode —
+negation in instructions is unreliable; few-shot negative examples can
+act as targets rather than anti-targets. **Reverted to v2.**
+
+### Model comparison (2026-05-25 smoke session, same 3 images)
+
+| Model | Instruction-following | Hallucination resistance | Latency |
+|---|---|---|---|
+| **qwen3-vl:8b** (v2 prompt) | Mostly good; meta-leak on ~1/3 outputs | Strong (no invented physical values, no spurious AXI-4 labels) | ~50-95s per image, consistent |
+| **qwen3-vl:8b** (v3 prompt with DO/DON'T) | Worse — model parroted DON'T examples back | Strong | 80-120s |
+| **llama3.2-vision:11b** (v3 prompt) | **Bad** — pervasive section headers ("**Clock Domain**", "**Constraints**", "**Scope**", "**Assumptions**") | **Bad** — invented "AXI-4 Signals", "clock signal is a 1.0 V signal", "Assumptions" sections | 12s OR timeout (>300s), unstable |
+| **llama4:scout** | NOT TESTED — 20-24 GB VRAM doesn't coexist with Phase C's 6 GB Parse load on the 16 GB card. Test deferred. | — | — |
+
+**Verdict so far:** qwen3-vl:8b on v2 prompt is the current chosen
+baseline. The remaining ~30% meta-commentary leak is a chat-training
+reflex that prompt iteration alone has a hard ceiling on; post-
+processing or model change is the next lever.
+
+### Open items for next session
+
+The smoke test was a **good-enough validation that VLM captioning is
+viable**, with two concrete unresolved questions:
+
+1. **Try Chain-of-Thought (CoT) prompt variant.** User-suggested
+   alternative structure that decomposes analysis into explicit steps:
+
+   ```
+   Analyze this engineering diagram. First, transcribe all text labels.
+   Second, identify the core components. Third, describe the
+   relationships and constraints between the components.
+   ```
+
+   CoT *could* improve grounding (forced text-transcription before
+   semantic interpretation = more OCR-honest output) and completeness
+   (explicit enumeration). Concrete caveats to watch for at pickup:
+   - CoT outputs tend to be VERBOSE (reasoning traces). For RAG chunks
+     this is usually undesirable — compact propositions chunk better.
+     Mitigation: instruct the model to do CoT silently and output only
+     the final propositions ("Internal reasoning: do step 1 then 2 then
+     3. Output: only the factual statements from step 3.").
+   - The user's example specifically mentions "[Component A] and
+     [Component B]" — that's a templated form that requires knowing
+     components in advance. For an automated sweep we don't know
+     components per figure; the prompt should generalize ("describe
+     the relationships between each pair of components").
+   - CoT could ENCOURAGE meta-commentary (the "Step 1, Step 2"
+     structure is itself meta). Watch for that.
+
+   Suggested CoT variant to smoke-test:
+   ```
+   Analyse this technical diagram in three internal steps, then write
+   the final output:
+
+   Step 1 (internal): Transcribe every text label visible in the
+   diagram.
+   Step 2 (internal): Identify each labelled component.
+   Step 3 (internal): Identify the relationships, scopes, and
+   constraints the diagram is asserting between those components.
+
+   Output: a list of factual statements about what the diagram is
+   asserting. No reference to the steps above. No introduction, no
+   conclusion. Begin with the first factual statement; end with the
+   last.
+   ```
+
+   Smoke-test against the same 3 pg099-axi-intc images for direct
+   comparison with v2.
+
+2. **Test llama4:scout (after Phase C completes).** ~20-24 GB VRAM
+   doesn't fit alongside Parse extraction. Once Phase C is done and
+   sd-webui can be restarted, the GPU is free — load llama4:scout
+   and re-run the same 3 images with v2 prompt for comparison. If
+   instruction-following is significantly better than qwen3-vl:8b on
+   the meta-commentary issue, switch the production VLM. Otherwise
+   stick with qwen3-vl:8b.
+
+3. **Build post-processing meta-stripper** as the deterministic fallback
+   regardless of model choice. ~10-20 lines of Python; strip lines
+   matching `^(The diagram|The figure|This diagram|These relationships|
+   These assertions|The following|Here is)` and section headers like
+   `^### `, `^\*\*[A-Z]`. Cheap insurance — even with a perfect VLM,
+   chunks should be propositions-only.
+
+4. **Smoke-test on diverse diagram types.** Current sample was 3 timing
+   diagrams. Test on state-machine diagrams (e.g. 8021Qbv §8.6.9), block
+   diagrams (e.g. 802.1AB Fig 6-1), register layout (e.g. pg099 Fig
+   2-X), packet format (e.g. 802.1AB LLDP TLV format). The prompt may
+   need diagram-type-specific tuning, OR a universal prompt may work
+   if the architecture is right.
+
+### Phase F state at handoff
+
+| Artefact | Location | Status |
+|---|---|---|
+| Smoke script | `scripts/extract/_smoke_vlm.py` | Committed; v2 prompt locked in; reads embedded PDF images, calls Ollama, prints captions |
+| Models pulled | `qwen3-vl:8b` (6.1 GB), `llama3.2-vision:11b` (7.8 GB) | Both in Ollama; llama3.2 underperforms so could be `ollama rm`'d to free disk |
+| `llama4:scout` | NOT pulled | Defer test until after Phase C completes (GPU constraints) |
+| Test PDFs used | `data/amd/pg099-axi-intc.pdf` (3 timing diagrams) | Insufficient diversity — broaden in next session |
+| Production integration | NOT BUILT | Currently just a smoke harness; the real `caption-images.py` per the Phase F architecture sketch is still to come |
 
 ---
 

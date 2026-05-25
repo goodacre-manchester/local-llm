@@ -41,6 +41,8 @@ from pathlib import Path
 
 import fitz  # PyMuPDF
 
+from clean_vlm_caption import strip as clean_caption
+
 OLLAMA_URL = "http://127.0.0.1:11434/api/chat"
 
 # Phase F captioning prompt — user-developed; iterated 2026-05-25.
@@ -207,8 +209,13 @@ def main(argv: list[str]) -> int:
         except Exception as exc:
             print(f"  ERROR: {exc}", flush=True)
             continue
-        print(f"  [{dt:.1f}s] caption:")
+        cleaned = clean_caption(caption)
+        print(f"  [{dt:.1f}s] caption (RAW, {len(caption)} chars):")
         for line in caption.splitlines():
+            print(f"    {line}")
+        delta = len(caption) - len(cleaned)
+        print(f"  -- caption (STRIPPED, {len(cleaned)} chars, -{delta}):")
+        for line in cleaned.splitlines():
             print(f"    {line}")
         print(flush=True)
 

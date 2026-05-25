@@ -398,50 +398,39 @@ processing or model change is the next lever.
 The smoke test was a **good-enough validation that VLM captioning is
 viable**, with two concrete unresolved questions:
 
-1. **Try Chain-of-Thought (CoT) prompt variant.** User-suggested
-   alternative structure that decomposes analysis into explicit steps:
+1. **Chain-of-Thought (CoT) prompt variant — SMOKED 2026-05-25.**
+   Added as `prompt-id=cot` in `_smoke_vlm.py` alongside the locked-in
+   v2. A/B run on the same 3 pg099-axi-intc images, qwen3-vl:8b,
+   concurrent with Phase C Parse extraction:
 
-   ```
-   Analyze this engineering diagram. First, transcribe all text labels.
-   Second, identify the core components. Third, describe the
-   relationships and constraints between the components.
-   ```
+   | | v2 (locked-in) | CoT (experimental) |
+   |---|---|---|
+   | Avg latency | 89.7s | **62.9s (−30%)** |
+   | Empty outputs | **1/3** (image 2) | 0/3 |
+   | Meta-commentary leak | Image 1 heavy intro + closer; closer leaks the suppression list itself ("does not require referencing specific visual elements like dashed lines or grid axes") | None |
+   | Output format | Long prose with bold | Clean numbered propositions |
+   | Spurious claims | Lower — relationships described accurately | **Higher** — invents "X transitions before Y" sequential ordering by reading visual left-to-right as temporal ordering |
+   | Component coverage | Comparable; image 3 catches processor_ack[1:0], first_ack, second_ack | Comparable; image 3 catches same |
 
-   CoT *could* improve grounding (forced text-transcription before
-   semantic interpretation = more OCR-honest output) and completeness
-   (explicit enumeration). Concrete caveats to watch for at pickup:
-   - CoT outputs tend to be VERBOSE (reasoning traces). For RAG chunks
-     this is usually undesirable — compact propositions chunk better.
-     Mitigation: instruct the model to do CoT silently and output only
-     the final propositions ("Internal reasoning: do step 1 then 2 then
-     3. Output: only the factual statements from step 3.").
-   - The user's example specifically mentions "[Component A] and
-     [Component B]" — that's a templated form that requires knowing
-     components in advance. For an automated sweep we don't know
-     components per figure; the prompt should generalize ("describe
-     the relationships between each pair of components").
-   - CoT could ENCOURAGE meta-commentary (the "Step 1, Step 2"
-     structure is itself meta). Watch for that.
+   **CoT wins on format discipline, latency, and consistency. Loses on
+   a new failure mode specific to timing diagrams: it reads visual
+   left-to-right as temporal ordering and emits spurious sequential
+   claims.** Whether this mode persists on block / state-machine /
+   register / packet diagrams is unknown — the entire sample was
+   timing diagrams from ONE PDF. The "Do not reference Step 1, Step 2,
+   Step 3" instruction worked (no meta-commentary about the analysis
+   process leaked through, which was the headline risk listed before
+   the smoke).
 
-   Suggested CoT variant to smoke-test:
-   ```
-   Analyse this technical diagram in three internal steps, then write
-   the final output:
+   **Decision is deferred** until smoke on diverse diagram types
+   (item 4 below) — at which point we can pick the prompt that wins on
+   the broadest set or accept a per-diagram-type prompt selector. For
+   now both prompts are retained in `_smoke_vlm.py`.
 
-   Step 1 (internal): Transcribe every text label visible in the
-   diagram.
-   Step 2 (internal): Identify each labelled component.
-   Step 3 (internal): Identify the relationships, scopes, and
-   constraints the diagram is asserting between those components.
-
-   Output: a list of factual statements about what the diagram is
-   asserting. No reference to the steps above. No introduction, no
-   conclusion. Begin with the first factual statement; end with the
-   last.
-   ```
-
-   Smoke-test against the same 3 pg099-axi-intc images for direct
-   comparison with v2.
+   Caveat on the v2 empty-output: may be GPU-contention with concurrent
+   Parse extraction (Parse held ~3.4 GB VRAM during the smoke), not a
+   deterministic prompt issue. Re-run after Phase C completes to
+   disentangle.
 
 2. **Test llama4:scout (after Phase C completes).** ~20-24 GB VRAM
    doesn't fit alongside Parse extraction. Once Phase C is done and
@@ -469,10 +458,10 @@ viable**, with two concrete unresolved questions:
 
 | Artefact | Location | Status |
 |---|---|---|
-| Smoke script | `scripts/extract/_smoke_vlm.py` | Committed; v2 prompt locked in; reads embedded PDF images, calls Ollama, prints captions |
+| Smoke script | `scripts/extract/_smoke_vlm.py` | Committed; **both `v2` (locked-in default) and `cot` (experimental) prompts present**; selectable via 4th CLI arg; reads embedded PDF images, calls Ollama, prints captions |
 | Models pulled | `qwen3-vl:8b` (6.1 GB), `llama3.2-vision:11b` (7.8 GB) | Both in Ollama; llama3.2 underperforms so could be `ollama rm`'d to free disk |
 | `llama4:scout` | NOT pulled | Defer test until after Phase C completes (GPU constraints) |
-| Test PDFs used | `data/amd/pg099-axi-intc.pdf` (3 timing diagrams) | Insufficient diversity — broaden in next session |
+| Test PDFs used | `data/amd/pg099-axi-intc.pdf` (3 timing diagrams) | A/B'd v2 vs CoT 2026-05-25 — see CoT findings above; STILL insufficient diversity, need state-machine / block / register / packet diagrams |
 | Production integration | NOT BUILT | Currently just a smoke harness; the real `caption-images.py` per the Phase F architecture sketch is still to come |
 
 ---

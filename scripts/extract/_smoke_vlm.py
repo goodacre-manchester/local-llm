@@ -14,10 +14,18 @@ Pure stdlib + PyMuPDF + urllib. Runs in the existing scripts/extract
 host's localhost:11434.
 
 Usage (inside the lightweight scripts/extract/.venv):
-    python _smoke_vlm.py <pdf-path> [max=3] [model=qwen3-vl:8b]
+    python _smoke_vlm.py <pdf-path> [max=3] [model=qwen3-vl:8b] [prompt=v2]
+
+`prompt` selects which prompt to send:
+  - v2   (default, locked-in): the propositional-only prompt iterated 2026-05-25.
+  - cot  (experimental): Chain-of-Thought variant — three internal steps
+         (transcribe labels / identify components / identify relationships)
+         then propositional output only. User-suggested 2026-05-25 to test
+         whether a forced internal transcription step improves grounding.
 
 Example:
     python _smoke_vlm.py /mnt/d/Projects/local-llm/data/amd/pg099-axi-intc.pdf 3
+    python _smoke_vlm.py /mnt/d/Projects/local-llm/data/amd/pg099-axi-intc.pdf 3 qwen3-vl:8b cot
 """
 
 from __future__ import annotations
@@ -56,7 +64,7 @@ OLLAMA_URL = "http://127.0.0.1:11434/api/chat"
 #       REVERTED to v2.
 #
 # Current locked-in prompt below = iteration v2.
-PROMPT = (
+PROMPT_V2 = (
     "This is a technical diagram from a specification or reference document. "
     "State only what the diagram is asserting — the facts, relationships, "
     "scopes, and constraints it is communicating.\n\n"
@@ -71,6 +79,34 @@ PROMPT = (
     "no conclusion, no meta-commentary about \"the diagram\" itself. Begin "
     "with the first fact; end with the last."
 )
+
+# Experimental Chain-of-Thought variant (2026-05-25). Hypothesis: forcing
+# an internal text-transcription step before generation grounds the output
+# in actual labels rather than visual impressions, reducing hallucinated
+# labels. Risk: CoT outputs tend verbose, so the prompt explicitly frames
+# the reasoning as silent/internal and constrains output to propositions.
+PROMPT_COT = (
+    "This is a technical diagram from a specification or reference document.\n\n"
+    "Analyse it in three internal steps before writing any output:\n"
+    "  Step 1 (internal): Transcribe every text label visible in the diagram.\n"
+    "  Step 2 (internal): Identify each labelled component.\n"
+    "  Step 3 (internal): Identify the relationships, scopes, and "
+    "constraints the diagram is asserting between those components.\n\n"
+    "Then write the output. The output is a list of factual statements "
+    "about what the diagram is asserting — the facts, relationships, "
+    "scopes, and constraints it is communicating.\n\n"
+    "Do not describe how the diagram is drawn, its visual structure, "
+    "arrows, layout, spatial arrangement, or visual annotations (reference "
+    "lines, dashed lines, grid lines, axes, color coding). Do not augment "
+    "with background knowledge. If a component is labelled but its role is "
+    "not explicitly stated, name it without interpreting it.\n\n"
+    "Do not reference Step 1, Step 2, Step 3, or the analysis process. "
+    "No introduction, no conclusion, no meta-commentary about \"the "
+    "diagram\" itself. Begin with the first factual statement; end with "
+    "the last."
+)
+
+PROMPTS = {"v2": PROMPT_V2, "cot": PROMPT_COT}
 
 
 def _iter_embedded_images(pdf_path: Path, max_images: int):
@@ -105,8 +141,8 @@ def _iter_embedded_images(pdf_path: Path, max_images: int):
                 return
 
 
-def _caption(model: str, png_bytes: bytes) -> tuple[str, float]:
-    """Send one image to the VLM with the canonical prompt. Returns
+def _caption(model: str, png_bytes: bytes, prompt: str) -> tuple[str, float]:
+    """Send one image to the VLM with the chosen prompt. Returns
     (caption_text, elapsed_seconds)."""
     b64 = base64.b64encode(png_bytes).decode("ascii")
     body = {
@@ -115,7 +151,7 @@ def _caption(model: str, png_bytes: bytes) -> tuple[str, float]:
         "messages": [
             {
                 "role": "user",
-                "content": PROMPT,
+                "content": prompt,
                 "images": [b64],
             }
         ],
@@ -145,11 +181,17 @@ def main(argv: list[str]) -> int:
         sys.exit(f"PDF not found: {pdf}")
     max_images = int(argv[1]) if len(argv) > 1 else 3
     model = argv[2] if len(argv) > 2 else "qwen3-vl:8b"
+    prompt_key = argv[3] if len(argv) > 3 else "v2"
+    if prompt_key not in PROMPTS:
+        sys.exit(f"Unknown prompt '{prompt_key}'; choose one of: "
+                 f"{', '.join(PROMPTS)}")
+    prompt = PROMPTS[prompt_key]
 
     print(f"[smoke-vlm] pdf       = {pdf.name}", flush=True)
     print(f"[smoke-vlm] max       = {max_images}", flush=True)
     print(f"[smoke-vlm] model     = {model}", flush=True)
-    print(f"[smoke-vlm] prompt    = {PROMPT[:80]}...", flush=True)
+    print(f"[smoke-vlm] prompt-id = {prompt_key}", flush=True)
+    print(f"[smoke-vlm] prompt    = {prompt[:80]}...", flush=True)
     print(flush=True)
 
     n = 0
@@ -158,7 +200,7 @@ def main(argv: list[str]) -> int:
         print(f"=== Image {n} — p.{page_no} (xref {xref}, "
               f"{len(png)/1024:.1f} KB) ===", flush=True)
         try:
-            caption, dt = _caption(model, png)
+            caption, dt = _caption(model, png, prompt)
         except Exception as exc:
             print(f"  ERROR: {exc}", flush=True)
             continue

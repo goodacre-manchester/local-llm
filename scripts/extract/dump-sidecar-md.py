@@ -713,7 +713,12 @@ def _emit_block(block: dict, lines: list[str], state: dict) -> None:
     page    = block.get("page") or 0
     section = (block.get("section") or "").strip()
     btype   = block.get("type", "text")
-    text    = (block.get("text") or "").strip()
+    # Code blocks (plain-text-pdf ASCII art / packet diagrams / tables)
+    # need their internal whitespace preserved exactly — only trim
+    # trailing whitespace. Other block types strip per the original
+    # contract.
+    raw     = block.get("text") or ""
+    text    = raw.rstrip() if btype == "code" else raw.strip()
 
     if not text:
         return
@@ -763,6 +768,16 @@ def _emit_block(block: dict, lines: list[str], state: dict) -> None:
         # text is already a markdown table — preserved whole by
         # _md_page_to_blocks(). Pass through.
         lines.append(text)
+        lines.append("")
+    elif btype == "code":
+        # Plain-text-pdf ASCII-art block (packet diagrams, vendor
+        # questionnaire tables, code listings in RFCs). Wrap in a fence
+        # so the markdown previewer preserves the monospace alignment
+        # exactly. Whitespace is intentional — do NOT collapse or
+        # reindent.
+        lines.append("```")
+        lines.append(text)
+        lines.append("```")
         lines.append("")
     else:
         # Paragraph. text already carries inline markdown (bold/sup/<br>) so

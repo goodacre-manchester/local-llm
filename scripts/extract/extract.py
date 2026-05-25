@@ -35,6 +35,7 @@ from __future__ import annotations
 import datetime as _dt
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -278,10 +279,86 @@ def _extract_docling(pdf: Path) -> list[dict]:
     return blocks
 
 
+# ─── Plain-text-PDF extractor (IETF RFCs and similar) ────────────────────────
+#
+# RFCs are published as monospace plain text rendered to PDF. pymupdf4llm
+# applies markdown conversion that COLLAPSES line breaks (everything is in
+# fixed-width font, so it can't tell prose from ASCII art) and wraps every
+# paragraph in ``` fences (because fixed-width = code in its heuristic).
+# Both behaviours are wrong for RFCs: prose paragraphs need natural flow,
+# ASCII-art packet diagrams and questionnaire tables need their alignment
+# preserved.
+#
+# This extractor uses PyMuPDF's geometric-blocks mode (`get_text("blocks")`)
+# which segments the page into logical paragraphs while preserving internal
+# line breaks. For each block we then:
+#   - Skip top/bottom-of-page single-line chrome (RFC running header +
+#     "[Page N]" footer).
+#   - Detect ASCII tables and packet-format diagrams (lines containing `|`
+#     or `+--` separators) and emit them as type:"code" so the renderer
+#     wraps them in a fence + preserves their alignment.
+#   - For prose blocks, collapse the ~72-col hard wraps into one line per
+#     logical paragraph so the .md reads naturally.
+
+_RFC_PAGE_FOOTER = re.compile(r"\[Page\s+\d+\]\s*$")
+
+
+def _extract_plain_text_pdf(pdf: Path) -> list[dict]:
+    import fitz  # PyMuPDF
+    doc = fitz.open(str(pdf))
+    blocks: list[dict] = []
+    for page_idx in range(len(doc)):
+        page = doc[page_idx]
+        page_no = page_idx + 1
+        page_height = page.rect.height
+        counter = -1
+        for x0, y0, x1, y1, text, _bn, btype in page.get_text("blocks"):
+            if btype != 0:  # 0 = text, 1 = image
+                continue
+            text = text.rstrip()
+            if not text.strip():
+                continue
+
+            # Chrome: single-line block within 60pt of top OR bottom is
+            # almost always the RFC running header or "[Page N]" footer.
+            # Also match the "[Page N]" pattern anywhere as a safety net.
+            is_single_line = "\n" not in text
+            near_top = y1 < 60
+            near_bottom = y0 > page_height - 60
+            if is_single_line and (near_top or near_bottom):
+                continue
+            if is_single_line and _RFC_PAGE_FOOTER.search(text):
+                continue
+
+            # Code/ASCII-art classification: a block with 2+ lines that
+            # each carry pipe-delimited cells, or any line with a `+--`
+            # separator, is a table/diagram. Preserve alignment.
+            lines = text.split("\n")
+            pipe_lines = sum(1 for ln in lines if ln.count("|") >= 2)
+            has_sep = any("+--" in ln or "+-+" in ln for ln in lines)
+            is_code = pipe_lines >= 2 or has_sep
+
+            counter += 1
+            bid = f"p{page_no}-b{counter}"
+            if is_code:
+                blocks.append({
+                    "id": bid, "page": page_no, "section": "",
+                    "type": "code", "text": text,
+                })
+            else:
+                collapsed = " ".join(ln.strip() for ln in lines if ln.strip())
+                blocks.append({
+                    "id": bid, "page": page_no, "section": "",
+                    "type": "text", "text": collapsed,
+                })
+    return blocks
+
+
 _BACKENDS = {
     "docling": _extract_docling,
     "pymupdf4llm": _extract_pymupdf4llm,
     "pypdf": _extract_pypdf,
+    "plain-text-pdf": _extract_plain_text_pdf,
 }
 
 
@@ -328,10 +405,18 @@ def process_collection(data_dir: Path, collection: str, backend: str, force: boo
                   file=sys.stderr, flush=True)
             continue
 
-        print(f"[{collection}] extracting ({backend}, {size_mb:.1f}MB): "
+        # Per-file backend override: .txt.pdf files are IETF RFCs and
+        # similar text-source PDFs. The general-purpose backends mangle
+        # their ASCII-art packet diagrams; route them to the dedicated
+        # plain-text extractor instead.
+        chosen_backend = (
+            "plain-text-pdf" if pdf.name.lower().endswith(".txt.pdf") else backend
+        )
+
+        print(f"[{collection}] extracting ({chosen_backend}, {size_mb:.1f}MB): "
               f"{pdf.name} ...", flush=True)
         try:
-            blocks = _BACKENDS[backend](pdf)
+            blocks = _BACKENDS[chosen_backend](pdf)
             blocks = _apply_toc(pdf, blocks)
         except Exception as exc:  # never let one bad PDF abort the run
             print(f"[{collection}] ERROR on {pdf.name}: {exc}", file=sys.stderr, flush=True)
@@ -340,7 +425,7 @@ def process_collection(data_dir: Path, collection: str, backend: str, force: boo
         out.write_text(json.dumps({
             "doc": pdf.name,
             "source_mtime": mtime,
-            "backend": backend,
+            "backend": chosen_backend,
             "blocks": blocks,
         }, ensure_ascii=False), "utf-8")
         print(f"[{collection}]   -> {len(blocks)} blocks -> {out.name}", flush=True)

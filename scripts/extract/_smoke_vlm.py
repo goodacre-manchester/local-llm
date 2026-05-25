@@ -108,14 +108,70 @@ PROMPT_COT = (
     "the last."
 )
 
-PROMPTS = {"v2": PROMPT_V2, "cot": PROMPT_COT}
+# Experimental context-aware variant (2026-05-25). User-suggested: feed
+# the surrounding document text alongside the image so the VLM has real
+# anchors for component names, acronyms, and the diagram's scope —
+# fighting the "fall back on training data" failure mode by replacing
+# the vacuum with actual reference material. New failure-mode risk: the
+# model might just echo the reference text instead of describing the
+# image; the prompt explicitly forbids this and asks the model to only
+# add facts that go beyond the reference.
+#
+# Contains {context} placeholder — formatted with page text at call time.
+PROMPT_V2_CTX = (
+    "Respond in English. Each line of your output is one complete "
+    "sentence stating one fact the diagram communicates: typically a "
+    "relationship between two named components (X provides Y to Z, X "
+    "contains Y, X is connected to Y), a constraint on a component, "
+    "or a property a component has.\n\n"
+    "The image is a technical diagram from a specification document. The "
+    "reference text below is from the same section — use it to spell "
+    "component names and acronyms exactly as they appear there. Do not "
+    "invent alternative spellings or expansions. Do not repeat facts that "
+    "are already explicitly stated in the reference text. Do not analyse "
+    "consistency between the diagram and the reference.\n\n"
+    "<reference>\n{context}\n</reference>\n\n"
+    "Do not describe how the diagram is drawn — no arrows, no layout, no "
+    "spatial arrangement, no visual annotations. Do not augment with "
+    "background knowledge beyond the reference text. If a component is "
+    "labelled but its role is not in the reference text, state that the "
+    "component exists without interpreting it.\n\n"
+    "Output format: plain-text sentences, one per line. No numbered lists, "
+    "no bulleted lists, no markdown headers, no bold, no section grouping, "
+    "no introduction, no conclusion, no meta-commentary."
+)
+
+PROMPTS = {"v2": PROMPT_V2, "cot": PROMPT_COT, "v2-ctx": PROMPT_V2_CTX}
+
+# Soft cap on context-text length when injecting into v2-ctx prompt.
+# IEEE-spec pages typically have 1500-3000 chars; we cap generously to
+# absorb dense pages but truncate runaway page-content overflow.
+_CONTEXT_MAX_CHARS = 4000
+
+
+def _page_context(doc, page_no_0indexed: int) -> str:
+    """Pull text from the image's page plus the page before and after,
+    joined with a separator. Captures captions that wrap across pages
+    and surrounding subsection text that anchors what the diagram is.
+    Truncates to _CONTEXT_MAX_CHARS to keep prompt size bounded."""
+    parts: list[str] = []
+    for offset in (-1, 0, 1):
+        idx = page_no_0indexed + offset
+        if 0 <= idx < len(doc):
+            text = doc[idx].get_text().strip()
+            if text:
+                parts.append(text)
+    joined = "\n\n".join(parts)
+    if len(joined) > _CONTEXT_MAX_CHARS:
+        joined = joined[:_CONTEXT_MAX_CHARS] + "\n\n[…context truncated…]"
+    return joined
 
 
 def _iter_embedded_images(pdf_path: Path, max_images: int, start_page: int = 1):
     """Walk the PDF from `start_page` (1-indexed, inclusive), yield
-    (page_no, image_index, png_bytes) for the first `max_images` embedded
-    raster images. Uses PyMuPDF's get_images() which pulls embedded raster
-    bytes directly — no rendering needed."""
+    (page_no, image_index, png_bytes, context_text) for the first
+    `max_images` embedded raster images. Uses PyMuPDF's get_images()
+    which pulls embedded raster bytes directly — no rendering needed."""
     doc = fitz.open(str(pdf_path))
     yielded = 0
     seen_xrefs: set[int] = set()
@@ -138,7 +194,7 @@ def _iter_embedded_images(pdf_path: Path, max_images: int, start_page: int = 1):
             # Skip very small images (icons, decorations) — typically <100x100
             if len(png) < 4000:
                 continue
-            yield (page_no + 1, xref, png)
+            yield (page_no + 1, xref, png, _page_context(doc, page_no))
             yielded += 1
             if yielded >= max_images:
                 return
@@ -200,12 +256,18 @@ def main(argv: list[str]) -> int:
     print(flush=True)
 
     n = 0
-    for page_no, xref, png in _iter_embedded_images(pdf, max_images, start_page):
+    uses_context = "{context}" in prompt
+    for page_no, xref, png, ctx in _iter_embedded_images(pdf, max_images, start_page):
         n += 1
+        ctx_note = f", ctx {len(ctx)} chars" if uses_context else ""
         print(f"=== Image {n} — p.{page_no} (xref {xref}, "
-              f"{len(png)/1024:.1f} KB) ===", flush=True)
+              f"{len(png)/1024:.1f} KB{ctx_note}) ===", flush=True)
+        if uses_context:
+            filled_prompt = prompt.format(context=ctx)
+        else:
+            filled_prompt = prompt
         try:
-            caption, dt = _caption(model, png, prompt)
+            caption, dt = _caption(model, png, filled_prompt)
         except Exception as exc:
             print(f"  ERROR: {exc}", flush=True)
             continue

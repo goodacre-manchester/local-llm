@@ -87,8 +87,11 @@ def _truncate_runaway_repetition(text: str) -> str:
 # smoke set, not speculation. New patterns get added as we discover them.
 _INTRO_PATTERNS = [
     re.compile(p, re.IGNORECASE) for p in [
-        # Direct meta-commentary openers
-        r"^based on the (provided )?(diagram|description|image|figure)[,:]",
+        # Direct meta-commentary openers — allow extra qualifiers between
+        # the noun and the `,`/`:` (e.g. "Based on the provided image
+        # description, ..." — `image` is followed by `description` then `,`).
+        r"^based on the (provided )?(diagram|description|image|figure|"
+        r"reference)[^,:]{0,40}[,:]",
         r"^the (diagram|figure|image) (asserts|describes|includes|contains|"
         r"depicts|shows|explicitly asserts|is asserting|specifies)",
         r"^the diagram is a (representation|schematic|block diagram|"

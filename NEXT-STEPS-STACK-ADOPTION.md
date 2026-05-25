@@ -301,6 +301,59 @@ register-layout figure) and judge whether the caption quality is worth
 the GPU+wall-clock cost. If quality is mediocre, defer further or pick
 a different VLM.
 
+### VLM captioning prompt (user-developed, 2026-05-25)
+
+The prompt below is the canonical instruction to pass to the VLM
+alongside each cropped figure. User-developed via experimentation;
+verified to produce RAG-friendly propositional captions rather than
+the visual-description captions VLMs default to.
+
+```
+This is a technical diagram from a specification or reference document.
+State only what the diagram is asserting — the facts, relationships,
+scopes, and constraints it is communicating. Do not describe how the
+diagram is drawn, its visual structure, arrows, layout, or spatial
+arrangement. Do not augment with background knowledge. If a component
+is labelled but its role is not explicitly stated, name it without
+interpreting it. Write only the assertions the diagram makes, as a
+set of factual statements about the subject matter.
+```
+
+**Why this prompt works for RAG** (worth preserving the rationale so
+future iterations don't drift):
+
+1. *Context anchor* (`"technical diagram from a specification..."`)
+   tells the VLM the genre/register to use — formal, factual, not
+   discursive.
+2. *Positive goal* (`"facts, relationships, scopes, constraints"`)
+   constrains output to the propositional content that retrieval can
+   actually match queries against. Atomic facts are higher density
+   per chunk than narrative descriptions.
+3. *Negative suppression of visual description* kills the default VLM
+   failure mode ("there is an arrow from box A to box B labelled X")
+   which produces text useless once retrieval surfaces the chunk in
+   a citation list.
+4. *Anti-hallucination via "do not augment with background knowledge"*
+   keeps the caption grounded in the figure. Without it, VLMs reflexively
+   add "this is a typical TSN state machine following IEEE 802.1Q
+   convention..." from training data — polluting RAG with unverified
+   model-knowledge that should be answered from authoritative chunks
+   elsewhere in the corpus.
+5. *Anti-hallucination via "name without interpreting"* prevents the
+   second failure case where the VLM invents roles for labelled
+   components ("the `CycleStart` counter increments at...").
+6. *Output format hint* (`"as a set of factual statements"`) shapes
+   the response into the form rag-server's chunker can split cleanly.
+
+**Implementation note:** when picking a VLM, smoke-test this prompt
+against several diagram types (state machine, timing chart, register
+layout, packet format). Different VLMs (qwen2.5-vl, llava, gpt-4v,
+gemma3-vision) have different prompt-following reliability —
+particularly on the negative instructions ("do not describe how the
+diagram is drawn"). The prompt's value depends on the VLM actually
+respecting suppression; revisit if the chosen model hallucinates
+through it.
+
 ---
 
 ## Phase H — JSON content quality for RAG and rendering (deferred)

@@ -577,25 +577,61 @@ def _escape_table_cell(s: str) -> str:
     return s.replace("\\", "\\\\").replace("|", "\\|").replace("\n", " ").replace("\r", " ").strip()
 
 
-def _render_latex_tabular(body: str) -> str:
-    """Decide the best markdown rendering for one LaTeX-tabular body."""
-    rows = _split_latex_rows(body)
+def _rows_to_gfm_or_bullets(rows: list[list[str]]) -> str:
+    """Shared helper used by both _render_latex_tabular and the caption-
+    driven bullet reconstruction: given parsed rows, render as a GFM
+    table when the shape is dominantly tabular (≥ 50% rows match modal
+    column count, modal ≥ 2). Single-cell rows in the middle become
+    sub-table dividers (bold heading + repeat of the column header for
+    each sub-section). Falls back to a bullet list when no tabular
+    structure dominates."""
     rows = [r for r in rows if not _row_is_decorative(r)]
     if not rows:
         return ""
+    counts = Counter(len(r) for r in rows if len(r) >= 2)
+    modal, freq = counts.most_common(1)[0] if counts else (0, 0)
 
-    # Multi-column with consistent count -> GFM table (first row = header).
-    col_counts = {len(r) for r in rows}
-    if col_counts == {len(rows[0])} and len(rows[0]) >= 2:
-        ncols = len(rows[0])
-        header = "| " + " | ".join(_escape_table_cell(c) for c in rows[0]) + " |"
-        sep    = "|" + "|".join(["---"] * ncols) + "|"
-        body_  = ["| " + " | ".join(_escape_table_cell(c) for c in r) + " |"
-                  for r in rows[1:]]
-        return "\n".join([header, sep, *body_])
+    if modal >= 2 and freq >= 2 and freq / max(1, len(rows)) >= 0.5:
+        # Tabular — emit as GFM table with sub-table partitioning at
+        # single-cell rows (multicolumn dividers in the source).
+        header_count = len(rows[0])
+        ncols = max(modal, header_count)
+        header_row = rows[0]
+        data_rows = rows[1:]
+        sub_tables: list[tuple[str | None, list[list[str]]]] = []
+        current_heading: str | None = None
+        current_rows: list[list[str]] = []
+        for r in data_rows:
+            if len(r) == 1 and r[0]:
+                if current_rows or current_heading is not None:
+                    sub_tables.append((current_heading, current_rows))
+                current_heading = r[0]
+                current_rows = []
+            else:
+                current_rows.append(r)
+        if current_rows or current_heading is not None:
+            sub_tables.append((current_heading, current_rows))
 
-    # Otherwise: bullet list. Single-cell rows -> cell content;
-    # multi-cell rows -> cells joined with " — ".
+        def _fmt_row(cells: list[str]) -> str:
+            padded = (cells + [""] * ncols)[:ncols]
+            return "| " + " | ".join(_escape_table_cell(c) for c in padded) + " |"
+
+        separator = "|" + "|".join(["---"] * ncols) + "|"
+        parts: list[str] = []
+        for idx, (heading, sub_rows) in enumerate(sub_tables):
+            if heading is not None:
+                if idx > 0:
+                    parts.append("")
+                parts.append(f"**{_escape_table_cell(heading)}**")
+                parts.append("")
+            if not sub_rows:
+                continue
+            parts.append(_fmt_row(header_row))
+            parts.append(separator)
+            parts.extend(_fmt_row(r) for r in sub_rows)
+        return "\n".join(parts).strip()
+
+    # Otherwise: bullet list joining cells with " — ".
     lines: list[str] = []
     for r in rows:
         nonempty = [c for c in r if c]
@@ -604,6 +640,11 @@ def _render_latex_tabular(body: str) -> str:
         joined = " — ".join(_escape_table_cell(c).replace("\\|", "|") for c in nonempty)
         lines.append(f"- {joined}")
     return "\n".join(lines)
+
+
+def _render_latex_tabular(body: str) -> str:
+    """Decide the best markdown rendering for one LaTeX-tabular body."""
+    return _rows_to_gfm_or_bullets(_split_latex_rows(body))
 
 
 def _process_latex_blocks(text: str) -> str:

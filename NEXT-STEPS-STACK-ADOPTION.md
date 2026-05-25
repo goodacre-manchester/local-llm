@@ -459,13 +459,15 @@ viable**, with two concrete unresolved questions:
    Caveat: the v2 empty-output on pg099 image 2 may be GPU-contention
    with concurrent Parse (peak ~10.5 GB), not deterministic.
 
-2. **Test llama4:scout (after Phase C completes).** ~20-24 GB VRAM
-   doesn't fit alongside Parse extraction. Once Phase C is done and
-   sd-webui can be restarted, the GPU is free — load llama4:scout
-   and re-run the same 3 images with v2 prompt for comparison. If
-   instruction-following is significantly better than qwen3-vl:8b on
-   the meta-commentary issue, switch the production VLM. Otherwise
-   stick with qwen3-vl:8b.
+2. ~~Test llama4:scout (after Phase C completes).~~ **REJECTED 2026-05-25
+   after Phase C completion check.** Ollama's `llama4:scout` is 67 GB
+   at default quant (the "17b" tag prefix is the active-per-token MoE
+   figure; full model is ~109B params across 16 experts). Won't fit
+   our 16 GB VRAM at any usable quantization. Unsloth's 1.78-bit IQ1
+   would technically fit in 24 GB but at that bit-width quality is
+   heavily degraded — likely worse than qwen3-vl:8b which is already
+   the validated best of the 5 VLMs tested. **qwen3-vl:8b formally
+   locked in as production VLM.**
 
 3. **Build post-processing meta-stripper — PROMOTED TO HIGHEST
    PRIORITY** after 2026-05-25 diverse-diagram smoke confirmed ~80% of
@@ -529,7 +531,7 @@ viable**, with two concrete unresolved questions:
 | Smoke script | `scripts/extract/_smoke_vlm.py` | Committed; both `v2` (default) and `cot` (experimental) prompts present; `start-page` CLI arg added 2026-05-25 |
 | **Production VLM** | **`qwen3-vl:8b`** (6.1 GB, qwen3 backbone) | **Confirmed best after alternative-model sweep 2026-05-25** — see below |
 | Alternatives tested + REJECTED | `MiniCPM-V 4.5`, `InternVL3.5-8B` (blaifa tag), `Granite 3.2 Vision`, `llama3.2-vision:11b` | All worse than qwen3-vl:8b on our specific failure modes — see "Alternative VLM sweep" section |
-| `llama4:scout` | NOT pulled | Defer test until after Phase C (needs 20-24 GB; doesn't fit alongside Parse) |
+| `llama4:scout` | **REJECTED 2026-05-25** | Ollama tag is 67 GB at default quant (the "17b" prefix is the active-per-token MoE figure; full model is ~109B params). Won't fit 16 GB VRAM at any usable quant. Unsloth IQ1 1.78-bit would fit in 24 GB but quality degradation makes it unlikely to beat qwen3-vl:8b. |
 | Test PDFs used | `pg099-axi-intc`, `8021AB-2016`, `pg047-gig-eth-pcs-pma`, `8021AS-2025` (survey) | 14 images smoked across 5 diagram types (timing, block, protocol, packet, state machine) — see findings in item 1 |
 | Production integration | NOT BUILT | Currently just a smoke harness; the real `caption-images.py` per the Phase F architecture sketch is still to come |
 
@@ -547,10 +549,10 @@ Researched and smoke-tested three alternatives to qwen3-vl:8b after the prompt-t
 
 **Key meta-finding from the sweep: general benchmarks don't predict our failure modes.** OCRBench / HallusionBench / ChartQA scores are useful but the agent's research weighted them too heavily. What actually matters for technical-spec captioning is whether the model invents component names and acronym expansions when uncertain — and on this metric, all four alternatives failed worse than qwen3-vl:8b. The qwen3-vl:8b failure mode is the smallest one we've seen.
 
-**Forward queue for VLM exploration** (in priority order, NOT BLOCKING):
-1. **llama4:scout** after Phase C completes — only untested candidate that fits the budget; larger model may have different hallucination pattern.
-2. **InternVL3.5-8B via HF transformers sidecar** — if Ollama tag breakage was the issue (not the model itself), running it native via HF could reveal whether the real model is competitive. Requires building a small Python sidecar like `scripts/nemo-rag/server.py`. Worth ~1-2 hours if llama4:scout also disappoints.
-3. **Qwen2.5-VL 7B / 32B** — agent dismissed as "same family pathologies" but worth a single smoke if everything else fails; cheap to pull.
+**Forward queue for VLM exploration** (NONE blocking; effectively exhausted at this VRAM budget):
+1. ~~**llama4:scout** after Phase C completes.~~ **Rejected 2026-05-25**: 67 GB doesn't fit 16 GB at any usable quant; degraded IQ1 quant unlikely to beat qwen3-vl:8b.
+2. **InternVL3.5-8B via HF transformers sidecar** — only remaining candidate worth time investment if a future need surfaces. The Ollama tag was broken (described diagrams as musical scores); a HF sidecar may reveal whether the model itself is competitive. Requires building a small Python sidecar like `scripts/nemo-rag/server.py`. ~1-2 hours work. **Not recommended unless qwen3-vl:8b proves inadequate for a specific use case** — the 5-model sweep validated qwen3-vl:8b as the best VLM available at this VRAM budget.
+3. **Qwen2.5-VL 7B / 32B** — agent dismissed as "same family pathologies"; not worth pulling.
 
 **Strong recommendation: stop optimising the model. Build the meta-stripper, then re-evaluate.** The framing-leak failure (~80% of bad outputs) is fixable in post; the hallucinated-component-name failure (~20% of bad outputs) is harder but smaller in volume. Meta-stripper has higher leverage than model swaps.
 

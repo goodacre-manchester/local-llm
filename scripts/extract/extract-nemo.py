@@ -130,19 +130,40 @@ def _parse_image(png_bytes: bytes) -> str:
     return text
 
 
-# Strip Parse's bbox / class metadata so downstream md parser sees clean
-# headings / tables / paragraphs. Patterns observed in actual output:
-#   <x_0.0859><y_0.0547> ...
+# Strip Parse's bbox / class / structural metadata so downstream md parser
+# sees clean headings / tables / paragraphs. Patterns observed in actual
+# Parse v1.2 output (and confirmed via 2026-05-25 IEEE corpus scan):
+#   <x_0.0859><y_0.0547> ...   coord markers (paired)
+#   <y_0.725>                  orphan coord (when <x_> was clipped)
 #   <class_Picture>, <class_List-item>, <class_Page-header>, etc.
-_COORD_RE = re.compile(r"<x_[\d.]+>\s*<y_[\d.]+>\s*", flags=re.DOTALL)
-_CLASS_RE = re.compile(r"<class_[A-Za-z0-9_-]+>", flags=re.DOTALL)
-_OLD_BOX_RE = re.compile(r"<box>.*?</box>", flags=re.DOTALL)  # alt form some versions used
-_OLD_CLS_RE = re.compile(r"<cls>.*?</cls>", flags=re.DOTALL)
+#   <tbc>                      "table being continued" — Parse emits at
+#                              end of every TOC entry / table row Parse
+#                              thinks spans pages; 1205 across IEEE corpus
+#   <u>...</u>                 HTML underline — Parse wraps URLs; no
+#                              markdown equivalent + noise for embeddings;
+#                              strip the tags, keep inner text
+#   <box>...</box> / <cls>...</cls>   older Parse versions
+#
+# IMPORTANT: many IEEE specs use angle-bracket notation in content
+# (e.g. `\<ESP-DA, ESP-SA, ESP-VID\>` for a 3-tuple, `\<MaxFrameSize\>`
+# for a placeholder). These appear with backslash-escaping in Parse
+# output and MUST be preserved. None of the strip patterns below match
+# escaped forms — they only match Parse-emitted unescaped markers.
+_COORD_RE      = re.compile(r"<x_[\d.]+>\s*<y_[\d.]+>\s*", flags=re.DOTALL)
+_ORPHAN_COORD  = re.compile(r"<[xy]_[\d.]+>")
+_CLASS_RE      = re.compile(r"<class_[A-Za-z0-9_-]+>", flags=re.DOTALL)
+_TBC_RE        = re.compile(r"<tbc>")
+_U_TAG_RE      = re.compile(r"</?u>")
+_OLD_BOX_RE    = re.compile(r"<box>.*?</box>", flags=re.DOTALL)
+_OLD_CLS_RE    = re.compile(r"<cls>.*?</cls>", flags=re.DOTALL)
 
 
 def _clean_parse_md(raw: str) -> str:
     cleaned = _COORD_RE.sub("", raw)
+    cleaned = _ORPHAN_COORD.sub("", cleaned)
     cleaned = _CLASS_RE.sub("", cleaned)
+    cleaned = _TBC_RE.sub("", cleaned)
+    cleaned = _U_TAG_RE.sub("", cleaned)
     cleaned = _OLD_BOX_RE.sub("", cleaned)
     cleaned = _OLD_CLS_RE.sub("", cleaned)
     return cleaned

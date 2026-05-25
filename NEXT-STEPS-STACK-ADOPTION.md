@@ -239,6 +239,70 @@ Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
 
 ---
 
+## Phase F — Image captioning sweep (deferred, run AFTER Phase C completes)
+
+The current extraction backends both drop visual semantic content from
+embedded figures:
+
+- **PyMuPDF4LLM** (AMD collection) emits placeholder strings
+  `**==> picture [W × H] intentionally omitted <==**` with no bbox and no
+  image data in the JSON.
+- **Nemotron Parse** (IEEE collection) sees figure pixels as part of the
+  page render and emits `<class_Picture>` markers + bboxes for them, but
+  `_clean_parse_md()` strips those markers; we currently only capture
+  any text Parse detected inside the figure region. State-machine
+  diagrams, timing charts, and other vector graphics end up with no
+  retrievable description even though they carry meaningful content for
+  RAG queries.
+
+**Proposed Phase F architecture** (rough sketch, design choices to be
+locked in when this phase is actually picked up):
+
+1. Modify both extractors to **preserve picture metadata** (page,
+   bbox-or-dims, ref-id) as `type: "picture"` blocks with empty text,
+   rather than stripping them entirely.
+2. Add `scripts/extract/caption-images.py` — post-extraction sweep that:
+   - For PyMuPDF4LLM-extracted JSONs: re-opens the PDF via PyMuPDF and
+     walks `page.get_images()` to pull embedded raster bytes
+   - For Parse-extracted JSONs: re-renders the page-region from the
+     preserved bbox markers
+   - Dumps each image to PNG, POSTs to a local vision-language model,
+     receives a short caption (~50-150 words)
+   - Injects the result as a new `type: "image_caption"` block linked
+     to the originating picture block, preserving page + section
+3. Re-run `/collections/<name>/ingest` so the captions become searchable
+   chunks with citations like `pg099-axi-intc.pdf — p.5, fig.2`.
+
+**VLM choice** (decide at pickup time; none of the current Ollama models
+are vision-capable):
+
+| Candidate | Size | Notes |
+|---|---|---|
+| `qwen2.5-vl:7b` | ~7 GB | Diagram OCR + structural reasoning; strong on technical figures |
+| `llava:7b` | ~5 GB | Faster, broader compatibility, weaker on schematics |
+| `gemma3:*-vision` (if available) | ~6 GB | Newer; check Ollama tag list at pickup time |
+
+Estimated wall-clock for captioning: ~3-10 s per image × a few hundred
+figures across the IEEE corpus = **1-3 h** GPU-locked sweep on top of
+Phase C's extraction time. AMD collection is image-light by comparison
+(register tables, not diagrams) — would be ~10-20 min.
+
+**Scope estimate:** ~6-8 h focused work (extractor metadata preservation
++ caption sweep script + smoke-test of VLM choice + plan/docs entries).
+
+**Hard prerequisite — Phase C must complete first.** Captioning needs
+the GPU; Phase C extraction is the higher-impact work already running.
+Don't start Phase F until Phase C.5 verifies the eval result has landed
+on the production `ieee` collection.
+
+**Decision before starting:** smoke-test the VLM on 3-5 representative
+figures from IEEE 802.1Q (one state-machine, one timing chart, one
+register-layout figure) and judge whether the caption quality is worth
+the GPU+wall-clock cost. If quality is mediocre, defer further or pick
+a different VLM.
+
+---
+
 ## Phase E — Optional teardown of the `nemo-parse` compose service
 
 Now that Phase 3a's in-process path is the adopted one, the original
@@ -305,7 +369,9 @@ Hand to a future session as one block.
 - [ ] Phase D.3 — docker-compose.yml comments updated
 - [ ] Phase D.4 — Memory cross-reference added
 - [ ] Phase D.5 — Single docs commit
-- [ ] Phase E — (deferred) tear down `nemo-parse` compose service
+- [ ] Phase F — (deferred, post-Phase-C) Image-captioning sweep — VLM smoke-test first, then design + build per the Phase F sketch above. Gate: Phase C.5 must verify the eval result first.
+- [ ] Phase E — (deferred indefinitely) tear down `nemo-parse` compose service
 
 Phases A, B, D can be done in a single ~3-4h session.
 Phase C requires overnight wall-clock.
+Phase F is a separate ~6-8 h follow-up plus ~1-3 h captioning wall-clock.

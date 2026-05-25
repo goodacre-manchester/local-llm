@@ -616,6 +616,60 @@ The active collection is used by default when no collection is specified in a re
 wsl -e bash -lc "curl -fsS -X PUT http://127.0.0.1:3000/active-collection -H 'Content-Type: application/json' -d '{\"name\":\"ieee\"}'"
 ```
 
+### 5. Adding a new collection — end-to-end checklist
+
+The §1-4 sections above describe each piece independently. For a brand-new
+`data/<newname>/` collection, the practical sequence is:
+
+```powershell
+# 1. Create the folder and drop PDFs in
+mkdir d:\Projects\local-llm\data\<newname>
+copy <pdfs> d:\Projects\local-llm\data\<newname>\
+
+# 2. Extract BEFORE first ingest. Pick the backend based on PDF layout:
+#    - Datasheets / single-column UGs / RFCs / textbooks  → PyMuPDF4LLM (CPU, fast)
+#    - Standards / dense-table specs / layout-heavy docs  → Nemotron Parse (GPU, hours)
+
+# 2a. PyMuPDF4LLM path:
+.\scripts\extract-pdfs.ps1 <newname>
+
+# 2b. OR Nemotron Parse path (pause sd-webui first to free GPU):
+wsl -e bash -lc "sudo docker compose stop sd-webui"
+.\scripts\extract-nemo.ps1 <newname>
+wsl -e bash -lc "sudo docker compose start sd-webui"
+
+# 3. Trigger ingest. (rag-server's AUTO_INGEST will also run on next
+#    container recreate, but explicit is faster and clearer.)
+wsl -e bash -lc "curl -fsS -X POST http://127.0.0.1:3000/collections/<newname>/ingest"
+
+# 4. (Optional, recommended) Render readable .md views for IDE preview:
+.\scripts\dump-sidecar-md.ps1 <newname>
+
+# 5. Recreate rag-server so /v1/models advertises the new collection in
+#    Open WebUI's selector:
+wsl -e bash -lc "cd /mnt/d/Projects/local-llm && sudo docker compose up -d rag-server --force-recreate"
+```
+
+Open WebUI's model dropdown will now show `<newname>` (fast profile) and
+`<newname>!deep`. You can use them per-request or `PUT /active-collection`
+to set the new collection as the default (step 4 above).
+
+**Why "extract before first ingest" matters:** if rag-server's
+`AUTO_INGEST` runs before any sidecar exists (e.g. you create the folder
+and then `docker compose up -d rag-server` without extracting first),
+ingest falls back to flat `pdf-parse` text — readable, but no page
+numbers, no clause-bounded chunks, tables flattened. The fallback logs
+loudly (`[ingest] FLAT pdf-parse fallback (no pages/sections)`) so it
+won't degrade silently, and the next post-extract ingest cleanly
+overwrites the flat chunks. The simplest way to avoid the wasted round
+is the sequence above: extract → ingest → recreate.
+
+**Per-collection extractor decision** — there's no auto-detection. The
+choice between PyMuPDF4LLM and Parse is a per-collection operator call
+based on the PDF type (see "PDF RAG — Setup §2" above for the
+backend comparison + the eval evidence behind the IEEE→Parse,
+AMD→PyMuPDF4LLM defaults).
+
 Check which collection is currently active:
 
 ```powershell

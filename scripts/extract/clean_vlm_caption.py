@@ -102,6 +102,19 @@ _INTRO_PATTERNS = [
         r"^the following (is|are) (a |the )?",
         r"^to address this task",
         r"^the diagram explicitly asserts",
+        # v2-ctx analytical-prose intros observed 2026-05-26 on
+        # qwen3-vl:8b: model wraps its output in summary framing despite
+        # the prompt's "no introduction" instruction.
+        r"^below (is|are) (a |the )?(concise |brief |short |detailed )?"
+        r"(summary|breakdown|list|description|analysis)",
+        r"^(here|below) (we|i) (summarise|present|describe|outline)",
+        r"^(key |the )?(facts?|points?|findings?|details?|takeaways?|"
+        r"observations?|notes?|highlights?|relationships?)( derived | extracted | "
+        r"from)?",
+        r"^the (diagram|figure|image) (communicates|provides|illustrates|"
+        r"shows|presents|conveys) the following",
+        r"^the (diagram|figure|image) is asserting",
+        r"^the diagram in this section",
         # Section-style headers used as preambles
         r"^#{1,4}\s",  # markdown h1-h4
         r"^\*\*[a-z][^*]{0,80}\*\*:?\s*$",  # bold standalone heading line
@@ -265,6 +278,15 @@ _INLINE_HEADER = re.compile(r"^\s*#{1,4}\s+")
 _BOLD_ONLY = re.compile(r"^\s*\*\*([^*]+)\*\*:?\s*$")
 _HR_LINE = re.compile(r"^\s*(-{3,}|={3,}|\*{3,})\s*$")
 
+# Numbered+bold section headers ("1. **Title**:", "- **Heading**:")
+# leak from the v2-ctx prompt on dense diagrams. Strip ONLY when the
+# line is entirely a header — bold identifiers inside a proposition
+# ("1. **MMCM** has CLKIN1 input connected to **IBUFD_S**.") must be
+# preserved. End-of-line anchor distinguishes the two cases.
+_NUMBERED_BOLD_HEADER = re.compile(
+    r"^\s*(?:\d+\.\s+|[-*+]\s+)\*\*([^*]+)\*\*\s*:?\s*$"
+)
+
 
 def _strip_inline_markdown(text: str) -> str:
     out = []
@@ -272,6 +294,12 @@ def _strip_inline_markdown(text: str) -> str:
         if _HR_LINE.match(line):
             continue  # horizontal rules → drop
         line = _INLINE_HEADER.sub("", line)  # `#### X` → `X`
+        # `1. **Header Title**:` standalone (whole line) → drop. The
+        # regex's $ anchor guarantees there's no body sentence; a line
+        # like "1. **MMCM** has CLKIN1 input" doesn't match and is
+        # preserved with its bold span intact.
+        if _NUMBERED_BOLD_HEADER.match(line):
+            continue
         bold_match = _BOLD_ONLY.match(line)
         if bold_match:
             # `**Heading:**` standalone → drop or unwrap

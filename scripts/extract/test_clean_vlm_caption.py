@@ -121,9 +121,11 @@ class TestIntroStripping(unittest.TestCase):
   - Located within the `<component_name>_block`."""
         out = strip(raw)
         self.assertNotIn("### Key Components", out)
-        # Note: the body still has nested ### headers that pass 5 will
-        # also strip, so the bold content should survive
-        self.assertIn("LogiCORE", out)
+        # The numbered+bold-only header lines (structural labels with
+        # no body sentence on the same line) get stripped along with
+        # the markdown structure. The actual prose content on the
+        # indented bullet survives.
+        self.assertIn("Located within", out)
 
     def test_strips_final_answer_intro(self):
         # From qwen3-vl:8b v2 image 1 (8021AB-2016 p.51 TLV format)

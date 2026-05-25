@@ -303,77 +303,145 @@ a different VLM.
 
 ---
 
-## Phase H — Extract-nemo.py extraction polish (deferred)
+## Phase H — JSON content quality for RAG and rendering (deferred)
 
-Addresses Parse-level failures that the markdown renderer can't fix.
-Surfaced by the 2026-05-25 PDF-vs-MD audit on `8021AB-2016`, which
-found three concrete Parse quality issues:
+**Reframed 2026-05-25** from "extract-nemo.py polish" to a broader
+JSON-quality phase. The 2026-05-25 PDF-vs-MD audits + the
+markdown-renderer iteration revealed that **most renderer fixes are
+forensic documentation of what the JSON should have carried in the
+first place**. The same content quality issues that make the .md hard
+to read also pollute the embeddings the rag-server builds for
+retrieval. Investing in JSON quality at extraction time is the
+leverage point: it improves RAG retrieval AND simplifies the .md
+renderer (which today carries ~250+ lines of pattern detection that
+would be unnecessary if the JSON already had typed `type:"table"` /
+`type:"code"` / `type:"picture"` blocks and chrome-tagged
+`is_chrome:true` blocks).
 
-1. **Token-collapse / generation-loop hallucination.** Parse went into
-   a repetition loop on the title page and produced ~thousands of
-   fabricated `<authorname>@gmail.com (FakeName)` entries before
-   degenerating to fragments like `(Sar) (Sar) (Sar)Electronic address:`.
-   Same failure class as the vLLM-served Parse from Phase 3a — the
-   HF-transformers + bundled `GenerationConfig` path is supposed to
-   prevent it but clearly didn't on this specific page.
-2. **Missing title-page metadata** (IEEE publisher address, "Revision
-   of IEEE Std 802.1AB-2009" notation, Abstract, copyright/ISBN).
-   Either Parse's vision encoder skipped these regions or they were
-   absorbed by the same generation loop.
-3. **MIB ASN.1 indentation lost.** Parse extracts text in reading order
-   but doesn't preserve the original column-aligned indentation that
-   makes SMIv2 source readable. The renderer's break-at-statement-
-   boundary heuristic is the best post-hoc cleanup possible without
-   re-parsing ASN.1.
+The current pipeline shape:
 
-**Phase H scope** (all in `scripts/extract/extract-nemo.py`):
+```
+PDF ──Parse/PyMuPDF4LLM──► sidecar.json (mixed content quality)
+                                │
+                ┌───────────────┴────────────────┐
+                ▼                                ▼
+         rag-server ingest                 dump-sidecar-md.py
+         (Chroma chunks +                  (.rag-md/*.md for
+          embeddings; both                  preview; band-aids
+          carry the JSON's                  much of the JSON's
+          quality issues)                   structural debt)
+```
 
-- **Preserve `<class_Picture>` markers + bbox info** for Phase F (image
-  captioning) insertion points. `_clean_parse_md()` currently strips
-  Parse's `<class_Picture>`, `<class_Figure>`, `<class_*>` and
-  `<x_..><y_..>` markers; without them Phase F has no anchor for where
-  to inject a caption and no bbox to crop the page region. Surfaced by
-  the 2026-05-25 8021AB-2016 audit: AB-2016 Figure 6-1 has no
-  placeholder in the sidecar because we threw it away. **Fix**: emit a
-  `type: "picture"` block with `bbox: {x0, y0, x1, y1}` + any text
-  Parse found inside the figure region. PyMuPDF4LLM-extracted sidecars
-  already have `==> picture [W x H] intentionally omitted <==`
-  placeholders for this purpose; Parse-extracted sidecars need parity.
-- **Per-page collapse-loop detection.** After generating each page,
-  scan the output for excessive short-fragment repetition (e.g. > 30%
-  of the cleaned text is a single ≤ 30-char substring repeated). If
-  detected: log, then either (a) retry with adjusted `GenerationConfig`
-  (lower max-new-tokens, repetition penalty), or (b) fall back to
-  PyMuPDF4LLM extraction for just that page. Composes naturally with
-  Phase G (which is whole-PDF level; this is per-page).
+Both downstream consumers benefit from cleaner JSON. The audit-
+documented Parse failures (token-collapse hallucination, missing
+title-page metadata, MIB ASN.1 indentation lost) are necessary fixes;
+the reframing adds **structural typing** to the scope.
+
+### Phase H scope
+
+**(A) Block-level typing.** Today every block is `type:"text"` (with
+"heading" / "table" as the only structural alternatives, and the
+"table" type only meaning "this content had `|` chars in markdown"
+rather than carrying structured cells). Phase H should emit:
+
+- `type:"table"` with `cells:[[...]]` (structured rows × columns) for
+  detected tabular content — not raw LaTeX or em-dash-separated text.
+  Today this detection lives in the renderer (`_render_latex_tabular`,
+  `_bullets_to_gfm_table`, ~250 lines). Move it to extract-nemo.py
+  post-processing.
+- `type:"code"` with `language:"asn1"` (or other detected language) for
+  MIB modules / pseudocode / state-machine code. Today the renderer
+  detects `DEFINITIONS ::= BEGIN`, `MODULE-IDENTITY`, etc. and wraps in
+  fences; Phase H should do this at extract time so retrieval can
+  treat code blocks differently from prose.
+- `type:"picture"` blocks with `bbox:{x0,y0,x1,y1}` for Phase F image
+  captioning insertion. Currently `_clean_parse_md()` strips Parse's
+  `<class_Picture>` and `<x_..><y_..>` markers — Parse SEES picture
+  regions but we throw the metadata away.
+
+**(B) Content cleanup at extract time.**
+
+- **Statistical chrome detection at JSON level.** Same algorithm the
+  renderer uses (look for content recurring near page boundaries with
+  normalized matching); emit chrome blocks with `is_chrome:true` so
+  rag-server's ingest can filter them and the renderer can drop them
+  uniformly. Result: ~30-50% fewer noise tokens in IEEE-spec
+  embeddings; cleaner citations.
+- **Multi-block consolidation at extract time.** When Parse splits a
+  logical unit (MIB module, multi-page table, multi-page caption)
+  across paragraphs, recombine them into one block. Today the renderer
+  has `_consolidate_code_fences()` that does this for MIB; the same
+  consolidation should happen at extract time so each chunk
+  corresponds to a semantic unit.
+- **Token-collapse / hallucination detection.** Per-page output scan
+  for excessive short-fragment repetition; either retry with adjusted
+  `GenerationConfig` (lower `max_new_tokens`, repetition penalty) or
+  fall back to PyMuPDF4LLM for that page. Same composition with
+  Phase G as before (G = whole-PDF dispatch; H = per-page guardrail).
 - **Bbox-aware section assignment.** Currently `_apply_toc()` in
   `extract.py` assigns `section` per page from the bookmark tree. When
   multiple clauses share a page (e.g. §11.3.x and §11.4 on the same
   page of 8021AB-2016), every block gets tagged with the last clause
-  start. The renderer band-aided this by using clause-derived heading
-  levels from heading text, but cleaner is to use Parse's bbox info to
-  resolve `section` per-block-position. Requires preserving the
-  `<x_..><y_..>` markers `_clean_parse_md()` currently strips — same
-  preservation work as the picture-marker bullet above.
-- **ASN.1 indentation preservation** (optional / stretch goal). Drop a
-  lightweight SMIv2 reformatter into `extract-nemo.py` so the JSON
-  sidecar's `text` for MIB-content blocks carries proper indentation.
-  This benefits the rag-server's ingest path too (better chunk
-  boundaries on MIB content) — not just markdown rendering.
+  start. Use Parse's bbox info to resolve per-block position. Same
+  bbox preservation work as the picture-marker bullet.
+- **ASN.1 indentation preservation.** A lightweight SMIv2 reformatter
+  so the JSON's `text` for code blocks carries proper indentation.
+  Helps both retrieval (better chunk boundaries on structured code)
+  and rendering (preview readability).
 
-**Audit-supporting evidence:** the 2026-05-25 PDF-vs-MD audit on
-`8021AB-2016.pdf` documented all three failure modes with quotes;
-the audit text can be retrieved from session history if needed.
+### Downstream simplifications
 
-**Effort:** ~1 day focused work. Collapse-loop detection is ~3h, the
-bbox-aware section assignment is ~4h (touches both `extract-nemo.py`
-markers and `extract.py`'s `_apply_toc`), the indentation preservation
-is the longest tail at ~4h with grammar-subset choices to lock in.
+After Phase H lands, the markdown renderer can drop roughly:
+- `_LATEX_TABULAR` + `_split_latex_rows` + `_render_latex_tabular` +
+  `_rows_to_gfm_or_bullets` (~200 lines) — JSON already has structured
+  `type:"table"` blocks
+- `_strip_orphan_latex` + `_ORPHAN_TABULAR_PREAMBLE` + `_LATEX_MULTI*`
+  (~50 lines) — JSON content is pre-cleaned
+- `_ASN1_MARKERS` + `_reformat_asn1` + `_wrap_code_blocks` (~100 lines)
+  — JSON already has typed `type:"code"` blocks with language metadata
+- `_consolidate_code_fences` (~100 lines) — JSON has pre-consolidated
+  blocks per semantic unit
+- `_detect_page_chrome` + `_normalize_chrome_line` (~40 lines) — chrome
+  is already tagged in JSON via `is_chrome:true`
+- `_collapse_long_runs` — applied during JSON cleanup, not rendering
+- `_TABLE_CAPTION` + `_bullet_to_cells` + `_bullets_to_gfm_table` +
+  `_detect_and_render_tables` (~150 lines) — no caption-driven recon-
+  struction needed when JSON has typed table blocks
 
-**Verification gate:** re-extract `8021AB-2016.pdf` post-fix; confirm
-title page is clean (no email-loop hallucination), all original metadata
-captured, MIB modules have preserved indentation. Re-run the regression
-benchmark to make sure none of the working prompts broke.
+**Estimated renderer shrink: from ~700 lines today to ~150 lines
+after Phase H.** What remains is the actual markdown-emission logic
+(heading levels, code fences, table syntax, page markers) — no
+detection / pattern matching.
+
+### Verification
+
+Phase H should be measured against the existing regression benchmark.
+Specifically:
+
+- **RAG retrieval impact.** Re-run `scripts/benchmark/run.ps1` against
+  the Phase-H-extracted IEEE collection. Plausibly pushes
+  `tas-vs-psfp-1` (the residual failure) toward PASS because cleaner
+  embeddings + chrome-filtered chunks should improve first-stage
+  recall on the disambiguation case.
+- **Renderer regression check.** Re-run `dump-sidecar-md.py` on the
+  cleaned JSON and visually compare against current renderer output.
+  After deleting the band-aid detection passes the simplified renderer
+  should produce equivalent or better .md output.
+- **Audit re-do.** Re-audit 8021AB-2016.pdf vs the post-Phase-H .md to
+  confirm the surfaced issues (email-loop hallucination, missing
+  metadata, indentation loss) are resolved.
+
+**Effort:** ~2-3 days focused work given the broader scope.
+- Block-level typing (A): ~1 day (post-processing pass on extracted
+  output; needs careful regex/heuristics for table and code detection)
+- Content cleanup (B): ~1 day (much of the logic ports directly from
+  the renderer; collapse-loop detection is the new piece)
+- Validation against benchmark + audit + renderer simplification:
+  ~half day
+
+**Audit-supporting evidence:** the 2026-05-25 PDF-vs-MD audits on
+`8021AB-2016.pdf` and `8021Q-2022.pdf` documented the failure modes
+with examples; the audit texts can be retrieved from session history.
 
 ---
 
@@ -526,11 +594,11 @@ Hand to a future session as one block.
 - [ ] Phase D.5 — Single docs commit
 - [ ] Phase F — (deferred, post-Phase-C) Image-captioning sweep — VLM smoke-test first, then design + build per the Phase F sketch above. Gate: Phase C.5 must verify the eval result first.
 - [ ] Phase G — (deferred, post-Phase-C) Speculative-fallback extraction dispatcher — removes the operator "which extractor?" decision via PyMuPDF4LLM-first-then-score-then-escalate-to-Parse. Strengthened by the 2026-05-25 audit: title-page hallucinations are exactly the failure mode Phase G handles. Gate: Phase C must complete so Parse-extracted IEEE sidecars exist as ground truth for threshold calibration.
-- [ ] Phase H — (deferred, post-Phase-C) Extract-nemo.py polish — per-page collapse-loop detection, bbox-aware section assignment, optional ASN.1 indentation preservation. Composes with Phase G (G = whole-PDF dispatch; H = per-page within Parse). ~1 day focused work. Gate: Phase C must complete to have current sidecars as before/after comparison.
+- [ ] Phase H — (deferred, post-Phase-C) **JSON content quality for RAG and rendering** — block-level typing (`type:"table"` with structured cells, `type:"code"` with language, `type:"picture"` with bbox), content cleanup at extract time (chrome tagging, multi-block consolidation, collapse-loop detection, bbox-aware section assignment, ASN.1 indentation). Re-framed from "extract-nemo polish" to the broader leverage point — same fixes benefit BOTH the rag-server ingest path (cleaner embeddings) and the markdown renderer (shrinks from ~700 lines to ~150 lines as detection logic moves upstream). Composes with Phase G (G = whole-PDF dispatch; H = per-page guardrails + JSON structural typing). ~2-3 days focused work. Gate: Phase C must complete to have current sidecars as before/after comparison.
 - [ ] Phase E — (deferred indefinitely) tear down `nemo-parse` compose service
 
 Phases A, B, D can be done in a single ~3-4h session.
 Phase C requires overnight wall-clock.
 Phase F is a separate ~6-8 h follow-up plus ~1-3 h captioning wall-clock.
 Phase G is a separate ~3-4 h follow-up; can run before or after Phase F (independent).
-Phase H is ~1 day focused work; logically precedes Phase G if both are pursued, but can also run independently.
+Phase H is ~2-3 days focused work; **highest-leverage of the deferred phases** because it improves BOTH RAG retrieval quality AND renderer simplicity. Logically precedes Phase G (cleaner JSON makes the Phase G fallback decision easier) and Phase F (proper picture blocks give Phase F insertion points). If only one post-Phase-C investment, Phase H is the one.

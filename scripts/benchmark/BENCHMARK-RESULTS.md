@@ -1,5 +1,19 @@
 # RAG Benchmark Results — Nemotron 3 Evaluation (2026-05-22 → 2026-05-24)
 
+> **2026-05-25 update:** the canonical IEEE 802.1Q source document was
+> switched from `8021Q-2022.pdf` (IEEE Std 802.1Q-2022, third edition,
+> 2022) to `8802-1Q-2024.pdf` (ISO/IEC/IEEE 8802-1Q:2024, the
+> international reprint — incorporates IEEE 802.1Qcw-2023 / Qdx-2024 /
+> 2021 maintenance amendments that the 2022 IEEE edition predates).
+> The benchmark prompts in `prompts.json` were updated to assert
+> `fileName_contains: "8802-1Q-2024"` and `CANONICAL_PREFERENCE` in
+> `app/server.js` / `.env.example` updated to match. The `8021Q-2022.pdf`
+> file was removed from `data/ieee/`. Section numbering is preserved
+> between the IEEE and ISO editions, so the §12.29 / §8.6.9 prompts
+> continue to assert on the same sections — just sourced from the
+> superseding ISO edition. All results below predate this switch and
+> reference the original 8021Q-2022.pdf where mentioned.
+
 Five-phase evaluation of three NVIDIA Nemotron 3 components against the
 local-llm RAG pipeline's documented TAS-vs-PSFP failure class. Every result
 below was produced by `scripts/benchmark/run.ps1` + `score.ps1` against the

@@ -7,10 +7,10 @@
       "question": "Is TAS the same as a PSFP stream gate, does it have an IPV?",
       "collection": "ieee",
       "profile": "deep",
-      "description": "Contrastive: PSFP-dominated vocabulary; expect TAS-defining clauses recalled and PSFP/IPV correctly distinguished.",
+      "description": "Contrastive: PSFP-dominated vocabulary; expect TAS-defining clauses recalled and PSFP/IPV correctly distinguished. fileName_contains was '8021Q-2022' before the 2026-05-25 canonical switch to the ISO 8802-1Q:2024 edition.",
       "expected_citations": [
-        { "fileName_contains": "8021Q-2022", "section_contains": "12.29" },
-        { "fileName_contains": "8021Q-2022", "section_contains": "8.6.9" }
+        { "fileName_contains": "8802-1Q-2024", "section_contains": "12.29" },
+        { "fileName_contains": "8802-1Q-2024", "section_contains": "8.6.9" }
       ],
       "must_not_abstain": true,
       "max_latency_s": 600,
@@ -24,8 +24,8 @@
       "profile": "deep",
       "description": "Contrastive: all three mechanisms named explicitly. Stronger first-stage recall expected vs tas-vs-psfp-1; still needs TAS clauses cited.",
       "expected_citations": [
-        { "fileName_contains": "8021Q-2022", "section_contains": "12.29" },
-        { "fileName_contains": "8021Q-2022", "section_contains": "8.6.9" }
+        { "fileName_contains": "8802-1Q-2024", "section_contains": "12.29" },
+        { "fileName_contains": "8802-1Q-2024", "section_contains": "8.6.9" }
       ],
       "must_not_abstain": true,
       "max_latency_s": 600,
@@ -37,9 +37,9 @@
       "question": "What does Clause 12.29 of IEEE 802.1Q-2022 specify?",
       "collection": "ieee",
       "profile": "deep",
-      "description": "Retrieval regression guard — explicit clause number in the prompt should always recall §12.29 chunks.",
+      "description": "Retrieval regression guard — explicit clause number in the prompt should always recall §12.29 chunks. Question wording references IEEE 802.1Q-2022 (the historical edition users still cite by name); the canonical source is now ISO 8802-1Q:2024 which preserves the same clause numbering. Citations should match the current source.",
       "expected_citations": [
-        { "fileName_contains": "8021Q-2022", "section_contains": "12.29" }
+        { "fileName_contains": "8802-1Q-2024", "section_contains": "12.29" }
       ],
       "must_not_abstain": true,
       "max_latency_s": 600,

@@ -67,12 +67,16 @@ function useNemoRerank(collectionName) {
   return Boolean(NEMO_RAG_URL) && NEMO_RERANK_COLLECTIONS.has(String(collectionName || ""));
 }
 // Near-duplicate handling: this corpus has the consolidated standard plus the
-// amendments and an ISO reprint, so the SAME text appears in several files
-// (8021Q-2022 ⊇ 8021Qbv-2015/8021Qci-2017; 8802-1Q-2024 is the ISO reprint).
-// When near-identical chunks collide, keep the one from the earliest-listed
-// preferred file so citations point at the current consolidated standard.
+// amendments. When near-identical chunks collide, keep the one from the
+// earliest-listed preferred file so citations point at the current
+// consolidated standard.
+// 2026-05-25: canonical for IEEE 802.1Q switched from `8021Q-2022` (IEEE
+// 802.1Q-2022, third edition) to `8802-1Q-2024` (ISO/IEC/IEEE 8802-1Q:2024,
+// the international reprint incorporating 802.1Qcw-2023 / Qdx-2024 plus the
+// 2021 maintenance amendments). The ISO 2024 edition supersedes the IEEE
+// 2022 edition and is the current spec for implementation compliance work.
 const CANONICAL_PREFERENCE = (process.env.CANONICAL_PREFERENCE ||
-  "8021Q-2022,ug1399-vitis-hls-en-us-2025.2").split(",").map((s) => s.trim()).filter(Boolean);
+  "8802-1Q-2024,ug1399-vitis-hls-en-us-2025.2").split(",").map((s) => s.trim()).filter(Boolean);
 const CHUNK_SIZE    = Number(process.env.CHUNK_SIZE   || 1000);
 // Clause-bounded chunking: text packing never crosses a bookmark/clause
 // boundary (truncated to this outline depth). Keeps every chunk clause-pure

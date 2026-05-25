@@ -6,6 +6,18 @@ phases run.** Full results in `scripts/benchmark/BENCHMARK-RESULTS.md`.
 This file is the per-session resumption doc; consume the results doc for
 the actual findings + recommendation.
 
+> **2026-05-25 update — canonical IEEE 802.1Q source switched.** The eval
+> documented below ran against `8021Q-2022.pdf` (IEEE Std 802.1Q-2022,
+> third edition). After the eval, the canonical IEEE 802.1Q source for
+> the live RAG stack was switched to `8802-1Q-2024.pdf` (ISO/IEC/IEEE
+> 8802-1Q:2024 — the international edition incorporating Qcw-2023,
+> Qdx-2024, and 2021 maintenance amendments) so implementation-
+> compliance queries cite the current standard. Historical references
+> below still mention `8021Q-2022.pdf` because that's what the eval
+> actually used; the file was removed from `data/ieee/` at the time of
+> the canonical switch. Section numbering is preserved between editions,
+> so the eval's §12.29 / §8.6.9 findings carry over unchanged.
+
 ---
 
 ## TL;DR — what shipped, what was rejected, what to do next

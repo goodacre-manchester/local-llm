@@ -362,6 +362,139 @@ _BACKENDS = {
 }
 
 
+# ─── Picture extraction (raster-image PDFs, pymupdf4llm-extracted) ───
+#
+# For PDFs without Parse's structural markup (AMD/Xilinx PG/UG docs and
+# similar), Phase H picture extraction uses PyMuPDF directly:
+#   - page.get_images() lists embedded raster image xrefs per page
+#   - page.get_image_rects(xref) gives bboxes in PDF coords (points)
+#   - text below the image (via get_text("blocks")) is scanned for
+#     "Figure N-M" / "Figure N.M" caption patterns
+#
+# Caption-detection heuristic: look at text blocks within 10% page
+# height below the image bbox, with x-overlap > 30%; if the block
+# starts with "Figure <num>" treat it as the caption. Multiple matches
+# concatenated.
+
+_PICTURE_MIN_PNG_BYTES = 4000   # skip icons / decorations under ~100x100
+_PICTURE_CAPTION_RE = re.compile(
+    r"^\s*(Figure|Fig\.?|Table)\s+\d+", re.IGNORECASE
+)
+
+
+def _extract_pymupdf_pictures(pdf: Path, images_dir: Path) -> list[dict]:
+    """For a non-Parse-extracted PDF, walk pages and emit type:picture
+    blocks for every substantive raster image. Returns the picture
+    blocks; caller merges them with text blocks from the main backend.
+
+    Each picture block: bbox (normalised 0-1), caption (figure title
+    text matched below the image, if any), image_path (relative to
+    the collection folder), text (= caption initially for searchability).
+    Persists the rendered PNG to images_dir/<pdf-stem>/<block-id>.png
+    so caption-images.py can iterate without re-rendering.
+    """
+    import fitz  # PyMuPDF
+
+    doc = fitz.open(str(pdf))
+    pdf_img_dir = images_dir / pdf.stem
+    blocks: list[dict] = []
+    seen_xrefs: set[int] = set()
+
+    for page_idx in range(len(doc)):
+        page = doc[page_idx]
+        page_no = page_idx + 1
+        page_w, page_h = page.rect.width, page.rect.height
+        if page_w <= 0 or page_h <= 0:
+            continue
+        # Pre-fetch text blocks once per page for caption-pairing.
+        text_blocks = page.get_text("blocks")
+
+        pic_idx = 0
+        for img_info in page.get_images(full=True):
+            xref = img_info[0]
+            if xref in seen_xrefs:
+                continue
+            seen_xrefs.add(xref)
+            # Get position(s) where this image is placed on the page.
+            try:
+                rects = page.get_image_rects(xref)
+            except Exception:
+                rects = []
+            if not rects:
+                continue
+            rect = rects[0]  # first placement; an image reused on a
+                             # different page is handled by xref-dedup
+            if rect.width < 100 or rect.height < 100:
+                continue
+            # Render the bbox region (so the persisted PNG matches what
+            # appears in the rendered page, including any overlays).
+            try:
+                zoom = 2048 / max(page_w, page_h)
+                pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom),
+                                      clip=rect, alpha=False)
+                png_bytes = pix.tobytes("png")
+            except Exception:
+                continue
+            if len(png_bytes) < _PICTURE_MIN_PNG_BYTES:
+                continue
+
+            # Caption pairing: find the CLOSEST text block below the
+            # image that starts with "Figure N..." / "Table N...".
+            # Only the closest match is the title — subsequent "Figure
+            # 3-4 shows..." sentences are body text referring to the
+            # NEXT figure, not the caption of THIS one.
+            caption_candidates: list[tuple[float, str]] = []
+            for tb in text_blocks:
+                tx0, ty0, tx1, ty1, ttext, _bn, tt = tb
+                if tt != 0:
+                    continue
+                if ty0 < rect.y1:
+                    continue
+                gap_pt = ty0 - rect.y1
+                if gap_pt > 0.10 * page_h:
+                    continue
+                overlap = min(rect.x1, tx1) - max(rect.x0, tx0)
+                tw = tx1 - tx0
+                if tw <= 0 or overlap / tw < 0.30:
+                    continue
+                stripped = (ttext or "").strip()
+                if not stripped:
+                    continue
+                if _PICTURE_CAPTION_RE.match(stripped):
+                    caption_candidates.append((ty0, stripped))
+            caption_candidates.sort()
+            # Take only the closest caption. Some AMD-style captions
+            # are multi-line in the same text block (e.g. "Figure 3-3:\n
+            # Input - Rising Edge Sensitive..."), already concatenated
+            # because get_text("blocks") returns the whole block as one
+            # text string. So one match is enough.
+            caption_txt = caption_candidates[0][1] if caption_candidates else ""
+
+            pic_idx += 1
+            pdf_img_dir.mkdir(parents=True, exist_ok=True)
+            img_file = pdf_img_dir / f"p{page_no}-pic{pic_idx}.png"
+            img_file.write_bytes(png_bytes)
+            rel_path = img_file.relative_to(images_dir.parent).as_posix()
+
+            # Bbox normalised to 0-1 page-relative coords (matching
+            # the Parse-path schema).
+            bbox = [rect.x0 / page_w, rect.y0 / page_h,
+                    rect.x1 / page_w, rect.y1 / page_h]
+            blocks.append({
+                "id": f"p{page_no}-pic{pic_idx}",
+                "page": page_no,
+                "section": "",
+                "type": "picture",
+                "bbox": bbox,
+                "caption": caption_txt,
+                "image_path": rel_path,
+                "text": caption_txt,
+                "vlm_description": "",
+            })
+
+    return blocks
+
+
 # ─── Driver ───────────────────────────────────────────────────────────────────
 
 # Optional size cap (MB). PDFs larger than this are skipped with a warning so
@@ -374,6 +507,11 @@ def process_collection(data_dir: Path, collection: str, backend: str, force: boo
     folder = data_dir / collection
     cache = folder / ".rag-cache"
     cache.mkdir(exist_ok=True)
+    # Per-collection persistent picture cache. extract.py creates it
+    # for the non-Parse backends (Parse has its own picture-extraction
+    # path inside extract-nemo.py with the same dir layout).
+    images_dir = folder / ".rag-images"
+    images_dir.mkdir(exist_ok=True)
 
     # Smallest first: the bulk of a collection becomes usable quickly and a
     # single giant PDF lands last instead of blocking everything behind it.
@@ -417,6 +555,22 @@ def process_collection(data_dir: Path, collection: str, backend: str, force: boo
               f"{pdf.name} ...", flush=True)
         try:
             blocks = _BACKENDS[chosen_backend](pdf)
+            # Picture extraction (Phase H pictures for non-Parse backends).
+            # Parse already extracts pictures inside extract-nemo.py;
+            # everything else needs this PyMuPDF-based pass to find
+            # embedded raster images and emit type:picture blocks.
+            if chosen_backend != "plain-text-pdf":
+                # plain-text-pdf is for RFCs etc. — by convention they
+                # have no figures worth captioning, skip the GPU later.
+                try:
+                    pic_blocks = _extract_pymupdf_pictures(pdf, images_dir)
+                    if pic_blocks:
+                        blocks = pic_blocks + blocks
+                        print(f"[{collection}]   + {len(pic_blocks)} picture block(s)",
+                              flush=True)
+                except Exception as pic_exc:
+                    print(f"[{collection}]   picture extraction failed: {pic_exc}",
+                          file=sys.stderr, flush=True)
             blocks = _apply_toc(pdf, blocks)
         except Exception as exc:  # never let one bad PDF abort the run
             print(f"[{collection}] ERROR on {pdf.name}: {exc}", file=sys.stderr, flush=True)

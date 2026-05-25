@@ -398,39 +398,57 @@ processing or model change is the next lever.
 The smoke test was a **good-enough validation that VLM captioning is
 viable**, with two concrete unresolved questions:
 
-1. **Chain-of-Thought (CoT) prompt variant — SMOKED 2026-05-25.**
-   Added as `prompt-id=cot` in `_smoke_vlm.py` alongside the locked-in
-   v2. A/B run on the same 3 pg099-axi-intc images, qwen3-vl:8b,
-   concurrent with Phase C Parse extraction:
+1. **Diverse-diagram smoke complete — v2 vs CoT — 2026-05-25.**
+   Added `prompt-id=cot` and `start-page` CLI args to
+   `_smoke_vlm.py`. Smoked 11 images across 3 PDFs and 3 diagram types,
+   qwen3-vl:8b, concurrent with Phase C Parse extraction (peak ~10.5 GB
+   VRAM out of 16 GB):
 
-   | | v2 (locked-in) | CoT (experimental) |
-   |---|---|---|
-   | Avg latency | 89.7s | **62.9s (−30%)** |
-   | Empty outputs | **1/3** (image 2) | 0/3 |
-   | Meta-commentary leak | Image 1 heavy intro + closer; closer leaks the suppression list itself ("does not require referencing specific visual elements like dashed lines or grid axes") | None |
-   | Output format | Long prose with bold | Clean numbered propositions |
-   | Spurious claims | Lower — relationships described accurately | **Higher** — invents "X transitions before Y" sequential ordering by reading visual left-to-right as temporal ordering |
-   | Component coverage | Comparable; image 3 catches processor_ack[1:0], first_ack, second_ack | Comparable; image 3 catches same |
+   | Sample | v2 avg latency | CoT avg latency | v2 issues | CoT issues |
+   |---|---|---|---|---|
+   | Timing (pg099-axi-intc, 3 img) | 89.7s | **62.9s** | Empty 1/3, intro+closer that leaks the suppression list itself | Spurious "X transitions before Y" temporal ordering |
+   | Block (8021AB-2016, 4 img) | **33.4s** | 60.2s | "Positioned above" occasionally | "Directional arrow from former to latter" + "positioned above" + intro/closer on complex |
+   | Protocol/clock (pg047 PCS/PMA, 4 img) | 121.6s | 120.9s | Meta-commentary + hallucinated components on 2/4 | Meta-commentary + hallucinated components on 2/4 |
+   | **Aggregate (11 img)** | **~80s** | **~80s** | Same failure modes on dense images | Same failure modes on dense images |
 
-   **CoT wins on format discipline, latency, and consistency. Loses on
-   a new failure mode specific to timing diagrams: it reads visual
-   left-to-right as temporal ordering and emits spurious sequential
-   claims.** Whether this mode persists on block / state-machine /
-   register / packet diagrams is unknown — the entire sample was
-   timing diagrams from ONE PDF. The "Do not reference Step 1, Step 2,
-   Step 3" instruction worked (no meta-commentary about the analysis
-   process leaked through, which was the headline risk listed before
-   the smoke).
+   **Three findings, not just preferences:**
 
-   **Decision is deferred** until smoke on diverse diagram types
-   (item 4 below) — at which point we can pick the prompt that wins on
-   the broadest set or accept a per-diagram-type prompt selector. For
-   now both prompts are retained in `_smoke_vlm.py`.
+   - **Neither prompt is a global winner.** v2 wins on timing+block
+     (faster, more disciplined); CoT wins on protocol diagrams (more
+     comprehensive). Both fail the same way on dense/complex diagrams.
+   - **The dominant failure mode is model-side, not prompt-side.**
+     When the diagram has dense annotations or unfamiliar conventions,
+     qwen3-vl:8b falls back on background knowledge **regardless of
+     prompt** — hallucinating component names ("System Test Agent" for
+     STA, "Multi-drop Master Device" for MMD, "FPGA Logic RX Elastic
+     Buffer" as a phantom). Both prompts forbid this; both get ignored.
+   - **A post-processing meta-stripper is the highest-leverage Phase F
+     investment** (was item 3, NOW PROMOTED TO ITEM 1 — see below).
+     ~80% of outputs are "good content + bad framing" — strip intros
+     ("Based on the diagram, the following...", "### Key Components"),
+     closers ("This summary aligns with..."), and visual-description
+     verbs ("positioned above", "via a directional arrow"), and you
+     recover propositional content. The hallucinated-component-name
+     failure mode is NOT fixable in post; that needs a stronger model.
 
-   Caveat on the v2 empty-output: may be GPU-contention with concurrent
-   Parse extraction (Parse held ~3.4 GB VRAM during the smoke), not a
-   deterministic prompt issue. Re-run after Phase C completes to
-   disentangle.
+   **Phase F design implication discovered:** IEEE specs are mostly
+   **vector** diagrams. `_smoke_vlm.py` only sees embedded raster via
+   `page.get_images()` and misses vector. Survey: 8021AS-2025 has 3
+   substantive raster images in 491 pages; 8021Qbv-2015 has 3 in 57;
+   only 8021AB-2016 (29 in 146 pages) and 802-3-2022 (208 in 7025) are
+   raster-heavy. Production `caption-images.py` must rasterize Parse's
+   `bbox` picture regions (Phase H "(A) Block-level typing" already
+   has `type:"picture"` with bbox; the pieces line up). The smoke
+   harness is unrepresentative of the IEEE corpus in this regard.
+
+   **Decision recap:**
+   - Both prompts retained in `_smoke_vlm.py` (no clear winner).
+   - Default stays v2 for now (slight edge on block + faster on simple
+     content) but the resolution is **stop optimising prompts; build
+     the meta-stripper.** Once stripper works, re-evaluate.
+
+   Caveat: the v2 empty-output on pg099 image 2 may be GPU-contention
+   with concurrent Parse (peak ~10.5 GB), not deterministic.
 
 2. **Test llama4:scout (after Phase C completes).** ~20-24 GB VRAM
    doesn't fit alongside Parse extraction. Once Phase C is done and
@@ -440,19 +458,54 @@ viable**, with two concrete unresolved questions:
    the meta-commentary issue, switch the production VLM. Otherwise
    stick with qwen3-vl:8b.
 
-3. **Build post-processing meta-stripper** as the deterministic fallback
-   regardless of model choice. ~10-20 lines of Python; strip lines
-   matching `^(The diagram|The figure|This diagram|These relationships|
-   These assertions|The following|Here is)` and section headers like
-   `^### `, `^\*\*[A-Z]`. Cheap insurance — even with a perfect VLM,
-   chunks should be propositions-only.
+3. **Build post-processing meta-stripper — PROMOTED TO HIGHEST
+   PRIORITY** after 2026-05-25 diverse-diagram smoke confirmed ~80% of
+   VLM outputs are "good content + bad framing" rather than "bad
+   content". The smoke also showed neither prompt fixes framing
+   reliably on dense diagrams; a deterministic stripper is the most
+   leverage left.
 
-4. **Smoke-test on diverse diagram types.** Current sample was 3 timing
-   diagrams. Test on state-machine diagrams (e.g. 8021Qbv §8.6.9), block
-   diagrams (e.g. 802.1AB Fig 6-1), register layout (e.g. pg099 Fig
-   2-X), packet format (e.g. 802.1AB LLDP TLV format). The prompt may
-   need diagram-type-specific tuning, OR a universal prompt may work
-   if the architecture is right.
+   Concrete patterns observed in the smoke that the stripper should
+   handle (from actual outputs, not speculation):
+   - **Intro sentences**: `^(Based on the diagram|The diagram (asserts|
+     explicitly asserts|asserts the following|includes|describes)|
+     The figure|This diagram|These relationships|These assertions|
+     Here is|Here are the|The following|Key (Components|Assertions)|
+     ### )` — strip if at start of output.
+   - **Closer paragraphs**: lines like `^(This (summary|analysis|
+     interpretation|setup|description) (accurately|aligns|reflects|
+     captures|is typical)|These (assertions|relationships) describe|
+     For (precise|more) (details|information)|This interpretation is
+     derived from)` — strip these and everything after to end of
+     output.
+   - **Visual-description verbs in inline propositions**:
+     `(positioned above|positioned below|positioned directly|via a
+     directional arrow|via a dashed (line|arrow)|connected via a
+     directional|from left to right|in the diagram's structure)` —
+     these are harder; strip the whole proposition or rewrite to
+     "connected to" / "contains" form.
+   - **Markdown structure leak**: `^#{1,4} ` headers, `^\*\*[A-Z]`
+     bold headings, `^\| .* \|$` tables — these should be stripped or
+     converted to flat propositions.
+   - **LaTeX leak**: `\\boxed{...}` (observed once on pg047 image 3).
+   - **Hallucinated training-data expansions**: harder; "STA (System
+     Test Agent)" — when a known acronym is followed by a parenthetical
+     expansion that doesn't match the spec, strip the parenthetical.
+     Needs an acronym dictionary OR could just strip any
+     `^[A-Z]{2,6}( \(.+?\))$` form.
+
+   This is now a 60-120-line module, not 10-20 — the diverse-diagram
+   smoke surfaced more patterns than originally estimated. Should
+   live as `scripts/extract/clean_vlm_caption.py` so both
+   `_smoke_vlm.py` and the future `caption-images.py` can call it.
+
+4. **Diverse-diagram smoke — DONE 2026-05-25.** Findings in item 1
+   above. Covered timing (pg099), block (8021AB-2016), and protocol/
+   clock-gen (pg047) — 11 images total. State-machine + register-
+   layout diagrams in the IEEE corpus are vector (not raster) so the
+   current smoke harness can't reach them — see "Phase F design
+   implication" in item 1; once `caption-images.py` rasterizes Parse
+   picture-bboxes, those types will be reachable for a follow-up smoke.
 
 ### Phase F state at handoff
 

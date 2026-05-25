@@ -14,7 +14,7 @@ Pure stdlib + PyMuPDF + urllib. Runs in the existing scripts/extract
 host's localhost:11434.
 
 Usage (inside the lightweight scripts/extract/.venv):
-    python _smoke_vlm.py <pdf-path> [max=3] [model=qwen3-vl:8b] [prompt=v2]
+    python _smoke_vlm.py <pdf-path> [max=3] [model=qwen3-vl:8b] [prompt=v2] [start-page=1]
 
 `prompt` selects which prompt to send:
   - v2   (default, locked-in): the propositional-only prompt iterated 2026-05-25.
@@ -109,14 +109,15 @@ PROMPT_COT = (
 PROMPTS = {"v2": PROMPT_V2, "cot": PROMPT_COT}
 
 
-def _iter_embedded_images(pdf_path: Path, max_images: int):
-    """Walk the PDF, yield (page_no, image_index, png_bytes) for the first
-    `max_images` embedded raster images. Uses PyMuPDF's get_images() which
-    pulls embedded raster bytes directly — no rendering needed."""
+def _iter_embedded_images(pdf_path: Path, max_images: int, start_page: int = 1):
+    """Walk the PDF from `start_page` (1-indexed, inclusive), yield
+    (page_no, image_index, png_bytes) for the first `max_images` embedded
+    raster images. Uses PyMuPDF's get_images() which pulls embedded raster
+    bytes directly — no rendering needed."""
     doc = fitz.open(str(pdf_path))
     yielded = 0
     seen_xrefs: set[int] = set()
-    for page_no in range(len(doc)):
+    for page_no in range(max(0, start_page - 1), len(doc)):
         page = doc[page_no]
         for img_info in page.get_images(full=True):
             xref = img_info[0]
@@ -182,6 +183,7 @@ def main(argv: list[str]) -> int:
     max_images = int(argv[1]) if len(argv) > 1 else 3
     model = argv[2] if len(argv) > 2 else "qwen3-vl:8b"
     prompt_key = argv[3] if len(argv) > 3 else "v2"
+    start_page = int(argv[4]) if len(argv) > 4 else 1
     if prompt_key not in PROMPTS:
         sys.exit(f"Unknown prompt '{prompt_key}'; choose one of: "
                  f"{', '.join(PROMPTS)}")
@@ -191,11 +193,12 @@ def main(argv: list[str]) -> int:
     print(f"[smoke-vlm] max       = {max_images}", flush=True)
     print(f"[smoke-vlm] model     = {model}", flush=True)
     print(f"[smoke-vlm] prompt-id = {prompt_key}", flush=True)
+    print(f"[smoke-vlm] start     = p.{start_page}", flush=True)
     print(f"[smoke-vlm] prompt    = {prompt[:80]}...", flush=True)
     print(flush=True)
 
     n = 0
-    for page_no, xref, png in _iter_embedded_images(pdf, max_images):
+    for page_no, xref, png in _iter_embedded_images(pdf, max_images, start_page):
         n += 1
         print(f"=== Image {n} — p.{page_no} (xref {xref}, "
               f"{len(png)/1024:.1f} KB) ===", flush=True)

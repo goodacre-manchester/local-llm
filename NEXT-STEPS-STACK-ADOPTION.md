@@ -303,6 +303,68 @@ a different VLM.
 
 ---
 
+## Phase H — Extract-nemo.py extraction polish (deferred)
+
+Addresses Parse-level failures that the markdown renderer can't fix.
+Surfaced by the 2026-05-25 PDF-vs-MD audit on `8021AB-2016`, which
+found three concrete Parse quality issues:
+
+1. **Token-collapse / generation-loop hallucination.** Parse went into
+   a repetition loop on the title page and produced ~thousands of
+   fabricated `<authorname>@gmail.com (FakeName)` entries before
+   degenerating to fragments like `(Sar) (Sar) (Sar)Electronic address:`.
+   Same failure class as the vLLM-served Parse from Phase 3a — the
+   HF-transformers + bundled `GenerationConfig` path is supposed to
+   prevent it but clearly didn't on this specific page.
+2. **Missing title-page metadata** (IEEE publisher address, "Revision
+   of IEEE Std 802.1AB-2009" notation, Abstract, copyright/ISBN).
+   Either Parse's vision encoder skipped these regions or they were
+   absorbed by the same generation loop.
+3. **MIB ASN.1 indentation lost.** Parse extracts text in reading order
+   but doesn't preserve the original column-aligned indentation that
+   makes SMIv2 source readable. The renderer's break-at-statement-
+   boundary heuristic is the best post-hoc cleanup possible without
+   re-parsing ASN.1.
+
+**Phase H scope** (all in `scripts/extract/extract-nemo.py`):
+
+- **Per-page collapse-loop detection.** After generating each page,
+  scan the output for excessive short-fragment repetition (e.g. > 30%
+  of the cleaned text is a single ≤ 30-char substring repeated). If
+  detected: log, then either (a) retry with adjusted `GenerationConfig`
+  (lower max-new-tokens, repetition penalty), or (b) fall back to
+  PyMuPDF4LLM extraction for just that page. Composes naturally with
+  Phase G (which is whole-PDF level; this is per-page).
+- **Bbox-aware section assignment.** Currently `_apply_toc()` in
+  `extract.py` assigns `section` per page from the bookmark tree. When
+  multiple clauses share a page (e.g. §11.3.x and §11.4 on the same
+  page of 8021AB-2016), every block gets tagged with the last clause
+  start. The renderer band-aided this by using clause-derived heading
+  levels from heading text, but cleaner is to use Parse's bbox info to
+  resolve `section` per-block-position. Requires preserving the
+  `<x_..><y_..>` markers `_clean_parse_md()` currently strips.
+- **ASN.1 indentation preservation** (optional / stretch goal). Drop a
+  lightweight SMIv2 reformatter into `extract-nemo.py` so the JSON
+  sidecar's `text` for MIB-content blocks carries proper indentation.
+  This benefits the rag-server's ingest path too (better chunk
+  boundaries on MIB content) — not just markdown rendering.
+
+**Audit-supporting evidence:** the 2026-05-25 PDF-vs-MD audit on
+`8021AB-2016.pdf` documented all three failure modes with quotes;
+the audit text can be retrieved from session history if needed.
+
+**Effort:** ~1 day focused work. Collapse-loop detection is ~3h, the
+bbox-aware section assignment is ~4h (touches both `extract-nemo.py`
+markers and `extract.py`'s `_apply_toc`), the indentation preservation
+is the longest tail at ~4h with grammar-subset choices to lock in.
+
+**Verification gate:** re-extract `8021AB-2016.pdf` post-fix; confirm
+title page is clean (no email-loop hallucination), all original metadata
+captured, MIB modules have preserved indentation. Re-run the regression
+benchmark to make sure none of the working prompts broke.
+
+---
+
 ## Phase G — Speculative-fallback extraction (auto-backend dispatch, deferred)
 
 Removes the per-collection "which extractor?" operator decision in
@@ -347,6 +409,17 @@ threshold must route all `data/ieee/*` PDFs → Parse and all
 produces the Parse-extracted IEEE sidecars that we'd score against to
 tune thresholds. Without Phase C done, calibration would lack ground
 truth.
+
+**Strong evidence from the 2026-05-25 PDF-vs-MD audit on
+`8021AB-2016.pdf`**: title pages were exactly the failure mode Phase G
+is designed to handle. Parse hallucinated thousands of words of fake
+email addresses on the title page (a clean text-only region where
+PyMuPDF4LLM extracts cleanly). The Phase G dispatcher, if implemented,
+would have scored the Parse title-page output as "low quality"
+(extraction errored / contained repetition artifacts) and escalated to
+PyMuPDF4LLM for that PDF. Per-PDF dispatch composes with Phase H's
+per-page collapse-loop detection (Phase G is whole-PDF; Phase H is
+per-page within Parse).
 
 **Cons / risks** (honest list, for the pickup-time decision):
 
@@ -440,10 +513,12 @@ Hand to a future session as one block.
 - [ ] Phase D.4 — Memory cross-reference added
 - [ ] Phase D.5 — Single docs commit
 - [ ] Phase F — (deferred, post-Phase-C) Image-captioning sweep — VLM smoke-test first, then design + build per the Phase F sketch above. Gate: Phase C.5 must verify the eval result first.
-- [ ] Phase G — (deferred, post-Phase-C) Speculative-fallback extraction dispatcher — removes the operator "which extractor?" decision via PyMuPDF4LLM-first-then-score-then-escalate-to-Parse. Gate: Phase C must complete so Parse-extracted IEEE sidecars exist as ground truth for threshold calibration.
+- [ ] Phase G — (deferred, post-Phase-C) Speculative-fallback extraction dispatcher — removes the operator "which extractor?" decision via PyMuPDF4LLM-first-then-score-then-escalate-to-Parse. Strengthened by the 2026-05-25 audit: title-page hallucinations are exactly the failure mode Phase G handles. Gate: Phase C must complete so Parse-extracted IEEE sidecars exist as ground truth for threshold calibration.
+- [ ] Phase H — (deferred, post-Phase-C) Extract-nemo.py polish — per-page collapse-loop detection, bbox-aware section assignment, optional ASN.1 indentation preservation. Composes with Phase G (G = whole-PDF dispatch; H = per-page within Parse). ~1 day focused work. Gate: Phase C must complete to have current sidecars as before/after comparison.
 - [ ] Phase E — (deferred indefinitely) tear down `nemo-parse` compose service
 
 Phases A, B, D can be done in a single ~3-4h session.
 Phase C requires overnight wall-clock.
 Phase F is a separate ~6-8 h follow-up plus ~1-3 h captioning wall-clock.
 Phase G is a separate ~3-4 h follow-up; can run before or after Phase F (independent).
+Phase H is ~1 day focused work; logically precedes Phase G if both are pursued, but can also run independently.

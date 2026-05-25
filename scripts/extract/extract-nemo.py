@@ -51,6 +51,7 @@ from transformers import AutoModel, AutoProcessor, GenerationConfig
 # Reuse the established helpers from extract.py (markdown -> blocks, TOC overlay,
 # mtime serialisation). Same directory -> direct import.
 from extract import _md_page_to_blocks, _apply_toc, _iso_mtime
+from sanitize_collapse import sanitize_sidecar
 
 MODEL_ID  = os.environ.get("NEMO_PARSE_MODEL_ID", "nvidia/NVIDIA-Nemotron-Parse-v1.2")
 TARGET_PX = int(os.environ.get("NEMO_PARSE_TARGET_PX", "2048"))
@@ -262,12 +263,24 @@ def main(argv: list[str]):
                       file=sys.stderr, flush=True)
                 continue
 
-            out.write_text(json.dumps({
+            # Defensive: Parse occasionally enters a token-collapse
+            # runaway (single short token regenerated 100+ times). The
+            # 2026-05-25 IEEE sweep found 31 such blocks across 12 PDFs;
+            # every one of them was actively poisoning Chroma. Sanitize
+            # before write so new sidecars never carry the cascade.
+            sidecar_dict = {
                 "doc": pdf.name,
                 "source_mtime": mtime,
                 "backend": "nemotron-parse-v1.2",
                 "blocks": blocks,
-            }, ensure_ascii=False), "utf-8")
+            }
+            _, changes = sanitize_sidecar(sidecar_dict)
+            if changes:
+                total_saved = sum(c["before_len"] - c["after_len"]
+                                   for c in changes)
+                print(f"[{collection}]   sanitized {len(changes)} collapse "
+                      f"block(s) ({total_saved} chars removed)", flush=True)
+            out.write_text(json.dumps(sidecar_dict, ensure_ascii=False), "utf-8")
             print(f"[{collection}]   -> {len(blocks)} blocks -> {out.name}", flush=True)
 
     # Free GPU memory before exit so the next process (Ollama, sd-webui) can

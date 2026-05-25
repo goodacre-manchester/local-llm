@@ -303,6 +303,76 @@ a different VLM.
 
 ---
 
+## Phase G — Speculative-fallback extraction (auto-backend dispatch, deferred)
+
+Removes the per-collection "which extractor?" operator decision in
+favour of a fast-path-then-escalate dispatcher. Cheap PyMuPDF4LLM
+extraction runs universally (~seconds per PDF); a scoring step on the
+resulting sidecar decides whether to escalate to Nemotron Parse for
+that specific PDF. The expensive backend runs only where the cheap one
+isn't good enough, measured against concrete artifacts (placeholder
+counts, section coverage, block density) rather than structural
+predictions about the input PDF.
+
+**Algorithm sketch** (new top-level `scripts/extract.ps1` — existing
+`extract-pdfs.ps1` + `extract-nemo.ps1` stay as manual-override
+escape hatches):
+
+```
+For each PDF in <collection> lacking a current sidecar (mtime-skip):
+  1. Run PyMuPDF4LLM → data/<col>/.rag-cache/<pdf>.json
+  2. Score the sidecar:
+       - mean picture-omitted-placeholders per page
+       - section-field empty rate (post-_apply_toc)
+       - mean blocks per page (under-/over-fragmentation outliers)
+       - table-block ratio
+       - extraction errors during PyMuPDF4LLM
+  3. If aggregate score above threshold:
+       - (Stop sd-webui if running, to free GPU)
+       - Re-run Nemotron Parse on THIS PDF only → overwrites sidecar
+At end: print per-PDF table of {backend chosen, score, reason}
+        + restart sd-webui if any Parse runs occurred
+```
+
+**Why this beats the advisor approach** I sketched earlier (heuristic
+on the input PDF before extraction): the quality signal is *observed*
+(post-extraction artifacts), not *predicted* (structural inputs). The
+cost is paid only when needed; mixed collections work per-PDF without
+any operator input; failures are post-detectable so the regression
+benchmark catches mis-routes.
+
+**Calibration prerequisite — gated on Phase C completing**: the
+threshold must route all `data/ieee/*` PDFs → Parse and all
+`data/amd/*` PDFs → PyMuPDF4LLM, matching the eval's evidence. Phase C
+produces the Parse-extracted IEEE sidecars that we'd score against to
+tune thresholds. Without Phase C done, calibration would lack ground
+truth.
+
+**Cons / risks** (honest list, for the pickup-time decision):
+
+- Heuristic threshold can still mis-route a PDF; errors are post-
+  detectable (benchmark + override) but not preventable a priori.
+- A PDF that PyMuPDF4LLM extracts "cleanly" but produces retrieval-
+  killing chunks would slip through. Mitigated by tuning metrics
+  against the existing benchmark prompts (if PyMuPDF4LLM on IEEE
+  scores below threshold for the prompts that motivated Parse
+  adoption, the metric works).
+- First extraction of a Parse-warranting PDF is slightly slower
+  (PyMuPDF4LLM run + Parse run vs. straight-to-Parse). Marginal —
+  +10 s on a 6.5 h Parse job.
+- Corrupt / encrypted / scanned-as-image PDFs may throw during
+  PyMuPDF4LLM — fallback must treat "errored" identically to "low
+  quality" and escalate.
+- Does not solve image captioning (Phase F) or OCR for scanned PDFs.
+
+**Scope:** ~3-4 h focused work — new `scripts/extract.ps1` +
+`scripts/extract/extract_auto.py`, scoring/threshold calibration
+against `data/ieee/` + `data/amd/`, README §2/§5 updates demoting the
+manual-decision table to override-reference status, smoke verification
+that AMD doesn't fall back and at least one IEEE PDF does.
+
+---
+
 ## Phase E — Optional teardown of the `nemo-parse` compose service
 
 Now that Phase 3a's in-process path is the adopted one, the original
@@ -370,8 +440,10 @@ Hand to a future session as one block.
 - [ ] Phase D.4 — Memory cross-reference added
 - [ ] Phase D.5 — Single docs commit
 - [ ] Phase F — (deferred, post-Phase-C) Image-captioning sweep — VLM smoke-test first, then design + build per the Phase F sketch above. Gate: Phase C.5 must verify the eval result first.
+- [ ] Phase G — (deferred, post-Phase-C) Speculative-fallback extraction dispatcher — removes the operator "which extractor?" decision via PyMuPDF4LLM-first-then-score-then-escalate-to-Parse. Gate: Phase C must complete so Parse-extracted IEEE sidecars exist as ground truth for threshold calibration.
 - [ ] Phase E — (deferred indefinitely) tear down `nemo-parse` compose service
 
 Phases A, B, D can be done in a single ~3-4h session.
 Phase C requires overnight wall-clock.
 Phase F is a separate ~6-8 h follow-up plus ~1-3 h captioning wall-clock.
+Phase G is a separate ~3-4 h follow-up; can run before or after Phase F (independent).

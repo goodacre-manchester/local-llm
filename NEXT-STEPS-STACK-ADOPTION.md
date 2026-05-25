@@ -407,15 +407,24 @@ viable**, with two concrete unresolved questions:
    | Sample | v2 avg latency | CoT avg latency | v2 issues | CoT issues |
    |---|---|---|---|---|
    | Timing (pg099-axi-intc, 3 img) | 89.7s | **62.9s** | Empty 1/3, intro+closer that leaks the suppression list itself | Spurious "X transitions before Y" temporal ordering |
-   | Block (8021AB-2016, 4 img) | **33.4s** | 60.2s | "Positioned above" occasionally | "Directional arrow from former to latter" + "positioned above" + intro/closer on complex |
+   | Block (8021AB-2016 front, 4 img) | **33.4s** | 60.2s | "Positioned above" occasionally | "Directional arrow from former to latter" + "positioned above" + intro/closer on complex |
    | Protocol/clock (pg047 PCS/PMA, 4 img) | 121.6s | 120.9s | Meta-commentary + hallucinated components on 2/4 | Meta-commentary + hallucinated components on 2/4 |
-   | **Aggregate (11 img)** | **~80s** | **~80s** | Same failure modes on dense images | Same failure modes on dense images |
+   | Packet format + state machine (8021AB-2016 §8+§11, 3 img v2 only) | 98.2s | — | Image 1 wrapped in `\boxed{}` LaTeX, "### Final Answer"; image 2 PERFECT (no intro/closer/leak); image 3 has intro+closer | — |
+   | **Aggregate (14 img total)** | **~85s** | **~80s** (8 img) | Same failure modes on dense images | Same failure modes on dense images |
 
-   **Three findings, not just preferences:**
+   **Four findings, not just preferences:**
 
    - **Neither prompt is a global winner.** v2 wins on timing+block
      (faster, more disciplined); CoT wins on protocol diagrams (more
      comprehensive). Both fail the same way on dense/complex diagrams.
+   - **Framing variance is NON-DETERMINISTIC.** Image 2 (p.70 TX state
+     machine) was the cleanest v2 output of the whole smoke — 10
+     propositions, no intro/closer, no visual leak, 52s latency. The
+     very next image (p.71 RX state machine, same diagram type, same
+     prompt) had intro+closer+markdown headers despite identical
+     content quality. The meta-commentary leak is dice-roll, not
+     diagram-feature-driven. Confirms the meta-stripper is necessary
+     for production stability — you can't prompt your way out.
    - **The dominant failure mode is model-side, not prompt-side.**
      When the diagram has dense annotations or unfamiliar conventions,
      qwen3-vl:8b falls back on background knowledge **regardless of
@@ -487,7 +496,13 @@ viable**, with two concrete unresolved questions:
    - **Markdown structure leak**: `^#{1,4} ` headers, `^\*\*[A-Z]`
      bold headings, `^\| .* \|$` tables — these should be stripped or
      converted to flat propositions.
-   - **LaTeX leak**: `\\boxed{...}` (observed once on pg047 image 3).
+   - **LaTeX leak**: `\\boxed{...}` (observed on pg047 image 3 and
+     8021AB §8 image 1), `$$...$$` blocks, `$0 \\leq n \\leq 507$`
+     inline math, and "### Final Answer" framing as if the model is
+     answering a math word problem rather than describing a diagram.
+     This is a particularly subtle failure on packet-format diagrams
+     because they often contain bit-range constraints that the model
+     pattern-matches as math problems.
    - **Hallucinated training-data expansions**: harder; "STA (System
      Test Agent)" — when a known acronym is followed by a parenthetical
      expansion that doesn't match the spec, strip the parenthetical.

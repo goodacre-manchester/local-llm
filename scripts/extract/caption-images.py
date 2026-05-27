@@ -52,6 +52,13 @@ OLLAMA_URL  = os.environ.get("OLLAMA_URL", "http://127.0.0.1:11434/api/chat")
 VLM_MODEL   = os.environ.get("VLM_MODEL", "qwen3-vl:8b")
 CTX_CHARS   = int(os.environ.get("CAPTION_CTX_CHARS", "4000"))
 CTX_PAGES   = int(os.environ.get("CAPTION_CTX_PAGES", "2"))
+# Persist the sidecar JSON to disk every N captioned pictures. Large
+# files (e.g. 802-3-2022 with 2251 pictures @ ~60s/pic = ~33h) would
+# otherwise buffer the entire run's work in memory and lose it all on
+# any process death. 25 = a checkpoint every ~25 minutes — small enough
+# that crash-recovery loses at most one batch, large enough that disk
+# IO doesn't dominate.
+CHECKPOINT_EVERY = int(os.environ.get("CAPTION_CHECKPOINT_EVERY", "25"))
 
 # Locked-in v2-ctx prompt from the 2026-05-25 Phase F smoke. Lives here
 # (not imported from _smoke_vlm.py) so the production captioner is
@@ -268,7 +275,16 @@ def _process_sidecar(sidecar_path: Path, collection_folder: Path,
               f"{dt:.1f}s, raw {len(raw)} -> stripped {len(stripped)} chars",
               flush=True)
 
-    # Write back only if anything changed
+        # Checkpoint: flush JSON every CHECKPOINT_EVERY captioned blocks
+        # so a crash mid-file doesn't lose accumulated work. The skip-
+        # if-already-captioned check at the top of the loop makes
+        # restart cheap — already-captioned blocks are O(1) skipped.
+        if captioned % CHECKPOINT_EVERY == 0:
+            sidecar_path.write_text(json.dumps(d, ensure_ascii=False), "utf-8")
+            print(f"    [{sidecar_path.stem}] checkpoint: "
+                  f"{captioned} captioned, persisted to disk", flush=True)
+
+    # Final write for whatever's left since the last checkpoint.
     if captioned:
         sidecar_path.write_text(json.dumps(d, ensure_ascii=False), "utf-8")
 

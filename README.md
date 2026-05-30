@@ -1,8 +1,8 @@
 # Local LLM + PDF RAG Stack
 
-A self-hosted chat + PDF retrieval-augmented generation stack that runs entirely on local hardware. Drop PDFs into a folder, ask questions in a browser, get cited answers grounded in the original documents — including the figures.
+A self-hosted chat + PDF retrieval-augmented generation stack that runs entirely on local hardware. Drop PDFs into a folder, ask questions in a browser, get cited answers grounded in the original documents — including the figures. Optionally toggle per-chat web grounding for current-affairs and learning-gap questions.
 
-The stack is **local-only**: no cloud LLM calls, no telemetry. Everything runs on WSL2 + Docker + Ollama on a Windows host.
+The stack is **local-only for inference**: no cloud LLM calls, no telemetry. The chat models, embedders, reranker, image generator and vector store all run on the local GPU/CPU. When the per-chat **Web Search** toggle is enabled, search queries (not chat content) egress to external search engines via the self-hosted SearXNG; the LLM itself still runs locally.
 
 ## Capabilities
 
@@ -18,6 +18,7 @@ The stack is **local-only**: no cloud LLM calls, no telemetry. Everything runs o
 | **Clause-bounded chunking** | Text is packed within PDF bookmark boundaries; chunks are clause-pure (e.g. §12.29 chunks never bleed into §12.31). |
 | **Multi-query expansion** | The fast model decomposes the question into focused sub-queries for better recall. |
 | **Image generation** | Automatic1111 Stable Diffusion WebUI co-resident on the GPU; click the image button on any chat reply to render an SDXL image. |
+| **Web grounding** | Per-chat globe-icon toggle. Self-hosted SearXNG aggregates Google/Bing/DDG + Wikipedia/arXiv/Scholar/Stack Overflow + news engines; Open WebUI fetches the top pages via Playwright (handles cookie walls), embeds them, and feeds the most relevant chunks to the LLM with inline citations. Works with any Ollama model. |
 | **Editor integration** | An MCP server (`scripts/rag-mcp`) exposes the RAG collections as tools (`query_pdfs`, `list_collections`, …) for IDEs. |
 | **LAN access** | Four ports (chat UI, image gen UI, RAG API, Ollama API) can be opened to the local network with a single Windows Firewall rule. |
 | **Self-restarting** | Windows Startup-folder launcher brings the stack up on every logon; containers use `restart: unless-stopped`. |
@@ -34,6 +35,7 @@ After startup, from Windows:
 | http://localhost:3000/v1/models | RAG model list (one entry per collection + `!deep` variants) |
 | http://localhost:8000/api/v1/heartbeat | Chroma heartbeat |
 | http://localhost:7860 | Stable Diffusion WebUI |
+| http://localhost:8888 | SearXNG (web search backend; also browsable as a search UI) |
 
 ## Installation
 
@@ -151,6 +153,22 @@ wsl -e bash -lc "python3 /mnt/d/Projects/local-llm/scripts/extract/build-picture
 Open WebUI has a per-message **image** button on every assistant reply. Click it to send the reply text as a prompt to the local `sd-webui` (Automatic1111 with the Juggernaut XL v9 SDXL checkpoint by default). The rendered image is inlined into the conversation. Generation costs ~6–10 s and ~8 GB VRAM per image on SDXL.
 
 Other trigger modes (auto-image per reply, tool calling) and the SDXL backend details are in **[design.md §10.6](design.md)**.
+
+### Web grounding (per chat)
+
+Open the chat input's **Integrations** menu (the 4-dots icon) and toggle the **globe icon** on for the current chat. From then on, every prompt in that chat triggers a SearXNG search, Open WebUI fetches the top result pages via Playwright (so cookie walls and JS-rendered sites work), chunks and embeds them, and feeds the most relevant snippets to the chat model as context. The reply ends with a **Sources** panel of clickable URLs and inline `[link]` citations.
+
+Curated engines (configured in [searxng/settings.yml](searxng/settings.yml)):
+
+| Category | Engines |
+|---|---|
+| General web | Google, Bing, DuckDuckGo, Startpage, Mojeek, Brave |
+| News / current affairs | Google News, Bing News, DuckDuckGo News |
+| Reference / learning | Wikipedia, Wikidata, arXiv, GitHub, Stack Overflow, Google Scholar, Semantic Scholar |
+
+Latency budget: ~3–10 s extra per reply (search + fetch + embed). Works with any model selected in the dropdown but **not** with the PDF-RAG collection models (`ieee`, `amd`, `rag-active`) — those route through the rag-server and have their own RAG pipeline. To make web grounding default-on, create a per-model preset under **Workspace → Models** with Web Search enabled in its capabilities.
+
+Privacy note: queries (not chat content) egress to the external search engines that SearXNG aggregates. The LLM, embeddings, page fetcher, and ranker all run locally.
 
 ### Editor integration (MCP)
 

@@ -1,0 +1,199 @@
+# SearXNG settings for the local-llm stack.
+#
+# Curated for two workflows: current-affairs grounding (news engines) and
+# learning-gap filling (Wikipedia/arXiv/StackExchange/GitHub). Engines
+# noisy or unhelpful for chat augmentation (images, video, maps, shopping,
+# torrents, regionally-biased engines) are explicitly disabled.
+#
+# Open WebUI's Web Search calls /search?format=json against this instance.
+# JSON output is mandatory in the formats list below or OW gets 403s.
+#
+# This file is version-controlled. The matching SEARXNG_SECRET is in
+# .env (gitignored) — generate once via `openssl rand -hex 32`.
+
+use_default_settings: true
+
+general:
+  debug: false
+  instance_name: "local-llm SearXNG"
+  enable_metrics: false
+
+server:
+  port: 8080
+  bind_address: "0.0.0.0"
+  secret_key: "!env SEARXNG_SECRET"
+  # No bot-detection rate limiter — local-LAN trusted use only. If exposed
+  # beyond the LAN, set this true and configure limiter.toml.
+  limiter: false
+  image_proxy: false
+  http_protocol_version: "1.0"
+  method: "GET"
+  default_http_headers:
+    X-Content-Type-Options: nosniff
+    X-Download-Options: noopen
+    X-Robots-Tag: noindex, nofollow
+    Referrer-Policy: no-referrer
+
+ui:
+  static_use_hash: true
+  default_locale: "en"
+  query_in_title: false
+  infinite_scroll: false
+  center_alignment: true
+  default_theme: simple
+  theme_args:
+    simple_style: dark
+  search_on_category_select: true
+  hotkeys: default
+
+# JSON is REQUIRED for the Open WebUI integration. Keeping html so the
+# instance is also browsable at http://localhost:8888 directly.
+search:
+  safe_search: 0
+  autocomplete: ""
+  default_lang: "en"
+  ban_time_on_fail: 5
+  max_ban_time_on_fail: 120
+  formats:
+    - html
+    - json
+
+# Outgoing-request budget per engine. Keep modest for a single-user LAN stack.
+outgoing:
+  request_timeout: 6.0
+  max_request_timeout: 12.0
+  pool_connections: 100
+  pool_maxsize: 20
+  enable_http2: true
+
+# ── Engine curation ────────────────────────────────────────────────────────
+#
+# Strategy: enable a small, diverse set covering three intents:
+#   * General web        – Google, Bing, DuckDuckGo, Mojeek, Startpage
+#   * News / fresh       – Google News, Bing News, DuckDuckGo News
+#   * Reference / depth  – Wikipedia, Wikidata, arXiv, GitHub, Stack Exchange
+#
+# Everything not listed below stays at SearXNG's upstream default (which is
+# disabled for most non-default engines). Engines explicitly disabled here
+# are ones that DEFAULT to on but produce results the chat-grounding flow
+# doesn't want (low-signal, regional bias, or media types LLMs can't use).
+engines:
+
+  # ── General web ─────────────────────────────────────────────────────
+  - name: google
+    disabled: false
+  - name: bing
+    disabled: false
+  - name: duckduckgo
+    disabled: false
+  - name: startpage
+    disabled: false
+  - name: mojeek
+    disabled: false
+  - name: brave
+    disabled: false
+
+  # ── News / current affairs ──────────────────────────────────────────
+  - name: google news
+    disabled: false
+  - name: bing news
+    disabled: false
+  - name: duckduckgo news
+    disabled: false
+
+  # ── Reference / learning gaps ───────────────────────────────────────
+  - name: wikipedia
+    disabled: false
+  - name: wikidata
+    disabled: false
+  - name: arxiv
+    disabled: false
+  - name: github
+    disabled: false
+  - name: stackoverflow
+    disabled: false
+
+  # ── Academic (deep technical reference) ─────────────────────────────
+  - name: google scholar
+    disabled: false
+  - name: semantic scholar
+    disabled: false
+  # Patents are not a first-class SearXNG engine. Use a site-restricted
+  # query against the general engines instead, e.g. type
+  # `site:patents.google.com QUERY` into the chat with web search on, or
+  # add the `!gp` shortcut in any general engine. For specialised patent
+  # work, browse patents.google.com directly.
+
+  # ── Explicit kills (default-on, unhelpful for chat grounding) ───────
+  - name: yandex
+    disabled: true
+  - name: yandex images
+    disabled: true
+  - name: qwant
+    disabled: true
+  - name: qwant news
+    disabled: true
+  - name: ahmia
+    disabled: true
+
+  # Image / video / map / shopping / file engines — we want text only
+  # for chat augmentation. Disable the broad defaults that ship enabled.
+  - name: google images
+    disabled: true
+  - name: bing images
+    disabled: true
+  - name: duckduckgo images
+    disabled: true
+  - name: flickr
+    disabled: true
+  - name: deviantart
+    disabled: true
+  - name: unsplash
+    disabled: true
+  - name: google videos
+    disabled: true
+  - name: bing videos
+    disabled: true
+  - name: youtube
+    disabled: true
+  - name: vimeo
+    disabled: true
+  - name: dailymotion
+    disabled: true
+  - name: piped
+    disabled: true
+  - name: invidious
+    disabled: true
+  - name: openstreetmap
+    disabled: true
+  - name: photon
+    disabled: true
+  - name: apple maps
+    disabled: true
+  - name: 1337x
+    disabled: true
+  - name: piratebay
+    disabled: true
+  - name: solidtorrents
+    disabled: true
+  - name: nyaa
+    disabled: true
+  - name: bt4g
+    disabled: true
+  - name: bandcamp
+    disabled: true
+  - name: soundcloud
+    disabled: true
+  - name: deezer
+    disabled: true
+  - name: mixcloud
+    disabled: true
+  - name: genius
+    disabled: true
+
+doi_resolvers:
+  oadoi.org: 'https://oadoi.org/'
+  doi.org: 'https://doi.org/'
+  sci-hub.se: 'https://sci-hub.se/'
+
+default_doi_resolver: 'oadoi.org'

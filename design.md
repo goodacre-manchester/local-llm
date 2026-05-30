@@ -62,6 +62,7 @@ The final command confirms the NVIDIA Container Toolkit is wired into the Docker
 │   ├── bootstrap-models.sh         # pulls all Ollama models
 │   ├── download-sd-models.ps1      # pulls the default SDXL checkpoint
 │   ├── sd-webui-entrypoint.sh      # ensures Blackwell-capable PyTorch in sd-webui
+│   ├── open-webui-entrypoint.sh    # surgical upstream-bug patch for Web Search
 │   ├── extract-pdfs.ps1            # entry for PyMuPDF4LLM extractor
 │   ├── extract-nemo.ps1            # entry for Nemotron Parse extractor
 │   ├── dump-sidecar-md.ps1         # renders human-readable .md views of sidecars
@@ -84,6 +85,8 @@ The final command confirms the NVIDIA Container Toolkit is wired into the Docker
 │   ├── nemo-rag/server.py          # optional manual Nemotron embed+rerank sidecar
 │   ├── rag-mcp/                    # stdio MCP server (editor integration)
 │   └── benchmark/                  # regression-guard prompt suite
+├── searxng/
+│   └── settings.yml                # curated engine list for Web Search
 ├── data/
 │   └── <collection>/
 │       ├── *.pdf                   # input documents
@@ -96,7 +99,8 @@ The final command confirms the NVIDIA Container Toolkit is wired into the Docker
 │   ├── open-webui/                 # Open WebUI SQLite + uploads
 │   ├── reranker/                   # reranker venv + HF model cache
 │   ├── sd-webui/                   # A1111 workspace + SDXL checkpoints + pip cache
-│   └── nemo-parse/                 # Parse HF cache + caption pipeline logs
+│   ├── nemo-parse/                 # Parse HF cache + caption pipeline logs
+│   └── open-webui-playwright/      # persisted Chromium for Playwright web loader
 ├── docs/archive/                   # historical hand-off docs (reference only)
 ├── design.md                       # this file
 ├── README.md                       # project description + capabilities + usage
@@ -177,13 +181,39 @@ The final command confirms the NVIDIA Container Toolkit is wired into the Docker
   - `./storage/sd-webui/pip-cache:/root/.cache/pip` — cu128 wheel cache.
 - Healthcheck: `GET /sdapi/v1/options` with `start_period: 900s` (first boot clones A1111 and installs PyTorch).
 
+### searxng
+
+- Image: `searxng/searxng:latest` (Docker Hub).
+- Port: `8888:8080` published to the host.
+- Mounts:
+  - `./searxng:/etc/searxng:rw` — host-controlled `settings.yml` (curated engine list).
+- Env:
+  - `SEARXNG_BASE_URL=http://127.0.0.1:8888/`
+  - `SEARXNG_SECRET=${SEARXNG_SECRET:-}` — read from `.env`. Generate once with `openssl rand -hex 32`.
+- Healthcheck: `GET /healthz` with `start_period: 60s`.
+- Engine curation (`searxng/settings.yml`):
+  - General web: Google, Bing, DuckDuckGo, Startpage, Mojeek, Brave.
+  - News: Google News, Bing News, DuckDuckGo News.
+  - Reference: Wikipedia, Wikidata, arXiv, GitHub, Stack Overflow, Google Scholar, Semantic Scholar.
+  - Disabled: Yandex, Qwant, image / video / map / shopping / file / torrent / music engines.
+- `search.formats: [html, json]` is mandatory — Open WebUI's Web Search calls `/search?format=json` and gets 403s without it.
+- `server.limiter: false` — bot-detection limiter off for trusted local-LAN use.
+- Not LAN-exposed by design (chroma + reranker are also internal-only; see §9).
+- No `depends_on` to/from other services. Open WebUI degrades to "no sources" on SearXNG outage rather than blocking startup.
+
 ### nemo-parse (deprecated, kept in compose)
 
 vLLM-served Nemotron Parse v1.2 entry. Not part of the autostart chain (no `restart` policy); `docker compose up` does not bring it up. The live Parse extractor instead runs in-process via HF transformers in `scripts/extract/.venv-nemo` (it produces stable output where the vLLM chat-completions API does not apply Parse's bundled `GenerationConfig`). Compose entry retained as the revival hook if a future vLLM release fixes that wiring.
 
+### Open WebUI entrypoint wrapper
+
+`open-webui` uses an entrypoint wrapper (`scripts/open-webui-entrypoint.sh`) bind-mounted to `/usr/local/bin/open-webui-entrypoint.sh`. On every container start the wrapper applies one surgical patch to `/app/backend/open_webui/retrieval/web/utils.py`, then execs the image's `start.sh`. The patch removes a duplicate `allow_redirects` keyword argument in `SafeWebBaseLoader._fetch` that otherwise raises `TypeError: ClientSession.get() got multiple values for keyword argument 'allow_redirects'` on every URL fetch and silently kills Web Search ("no sources found" replies). The script header records the upstream bug + the removal criterion (delete the wrapper when upstream fixes it).
+
+Web Search also requires `WEB_LOADER_ENGINE=playwright` for cookie-walled / JS-rendered sites (Guardian, BBC, most EU/UK news). Upstream `start.sh` runs `playwright install chromium` when that env is set; the ~600 MB Chromium cache is persisted via the `./storage/open-webui-playwright:/root/.cache/ms-playwright` host volume so container recreates don't re-download.
+
 ### Common notes
 
-All five active services use `restart: unless-stopped`. Startup ordering uses `depends_on: condition: service_healthy`. The Chroma image is pinned to `0.5.5` because `app/server.js` calls `/api/v1`, which is removed in 0.6+.
+All six active services (`chroma`, `rag-server`, `reranker`, `open-webui`, `sd-webui`, `searxng`) use `restart: unless-stopped`. Startup ordering uses `depends_on: condition: service_healthy`. The Chroma image is pinned to `0.5.5` because `app/server.js` calls `/api/v1`, which is removed in 0.6+.
 
 ## 5. RAG Server API
 
@@ -499,6 +529,7 @@ Test from a peer machine, not the Windows host itself. In mirrored mode, the hos
 - Open WebUI gates LAN access with `WEBUI_AUTH=true`.
 - rag-server and Ollama are unauthenticated by default. If the LAN is not fully trusted, set `RAG_API_KEY` on rag-server and omit `11434` from the firewall rule (Ollama has no built-in auth).
 - sd-webui (`WEB_ENABLE_AUTH=false`) is local-only image generation; safe on a trusted LAN.
+- SearXNG (`8888`) and the internal services `chroma` (`8000`) and `reranker` (`8008`) are intentionally NOT in the firewall rule. They serve Open WebUI / rag-server over `127.0.0.1` only.
 
 ## 10. Operational Reference
 
@@ -518,6 +549,7 @@ wsl -e bash -lc "curl -fsS http://127.0.0.1:8000/api/v1/heartbeat"
 wsl -e bash -lc "curl -fsS http://127.0.0.1:3000/health"
 wsl -e bash -lc "curl -I http://127.0.0.1:8080"
 wsl -e bash -lc "curl -fsS http://127.0.0.1:7860/sdapi/v1/options >/dev/null && echo sd-webui: ok"
+wsl -e bash -lc "curl -fsS http://127.0.0.1:8888/healthz && echo  searxng: ok"
 wsl -e bash -lc "sudo docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'"
 ```
 
@@ -575,10 +607,12 @@ Keep these invariant unless intentionally changed:
 1. WSL Ubuntu 24.04, Docker via `docker-ce`, Ollama via the official installer.
 2. Chroma image `chromadb/chroma:0.5.5` (coupled to `/api/v1` calls in `server.js`).
 3. Collection folder convention: `data/<name>/` with PDFs, `.rag-cache/`, `.rag-images/`, `.rag-md/`.
-4. Default ports: `11434` (Ollama), `8000` (Chroma), `3000` (rag-server), `7860` (sd-webui), `8008` (reranker), `8080` (open-webui).
-5. Storage paths: `storage/chroma`, `storage/open-webui`, `storage/reranker`, `storage/sd-webui`, `storage/nemo-parse`.
+4. Default ports: `11434` (Ollama), `8000` (Chroma), `3000` (rag-server), `7860` (sd-webui), `8008` (reranker), `8080` (open-webui), `8888` (searxng).
+5. Storage paths: `storage/chroma`, `storage/open-webui`, `storage/open-webui-playwright`, `storage/reranker`, `storage/sd-webui`, `storage/nemo-parse`.
 6. The `sd-webui-entrypoint.sh` host-mount + entrypoint wiring (Blackwell PyTorch upgrade).
-7. Pre-pointed Open WebUI image-gen env vars in compose.
+7. The `open-webui-entrypoint.sh` host-mount + entrypoint wiring (Web Search bug patch — see service spec in §4).
+8. Pre-pointed Open WebUI image-gen + Web Search env vars in compose (`ENABLE_IMAGE_GENERATION`, `AUTOMATIC1111_BASE_URL`, `ENABLE_WEB_SEARCH`, `WEB_SEARCH_ENGINE`, `SEARXNG_QUERY_URL`, `WEB_LOADER_ENGINE`, …).
+9. Curated `searxng/settings.yml` engine list (committed; the matching `SEARXNG_SECRET` is in `.env`, gitignored).
 
 All PowerShell scripts derive the repo path from `$PSScriptRoot` — no hardcoded paths. The repo is relocatable across drives or directories.
 

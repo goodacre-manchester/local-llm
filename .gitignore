@@ -21,6 +21,11 @@ storage/
 # Benchmark run outputs (the scripts + prompts.json are committed; results aren't)
 scripts/benchmark/results/
 
+# SearXNG generated state (settings.yml IS committed; runtime artefacts aren't)
+searxng/secret_key
+searxng/uwsgi.ini
+searxng/state/
+
 # Editor / OS
 .vscode/*
 !.vscode/mcp.json

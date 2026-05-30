@@ -148,6 +148,11 @@ services:
     container_name: local-llm-open-webui
     restart: unless-stopped
     network_mode: host
+    # Entrypoint wrapper applies a surgical upstream-bug patch on every
+    # container start (SafeWebBaseLoader._fetch duplicate-kwarg issue
+    # that silently kills Web Search). See script header for the why +
+    # removal criterion.
+    entrypoint: ["/bin/bash", "/usr/local/bin/open-webui-entrypoint.sh"]
     environment:
       - OLLAMA_BASE_URL=http://127.0.0.1:11434
       - WEBUI_AUTH=true
@@ -163,11 +168,76 @@ services:
       - IMAGE_GENERATION_MODEL=Juggernaut-XL_v9_RunDiffusionPhoto_v2
       - IMAGE_SIZE=1024x1024
       - IMAGE_STEPS=30
+      # Web search grounding via the SearXNG service below. Per-chat toggle
+      # in the chat input (globe icon); off by default. ENABLE_SEARCH_QUERY_
+      # GENERATION lets the LLM rephrase the user prompt into a better search
+      # query before SearXNG sees it (e.g. "what's new with X" → "X news 2026"),
+      # which materially improves current-affairs grounding quality.
+      #
+      # NOTE: Open WebUI only seeds these values into its config DB on first
+      # container creation. For an already-initialised instance, also toggle
+      # in Admin Panel → Settings → Web Search and save. These env vars are
+      # the authoritative source for fresh installs on new machines.
+      - ENABLE_WEB_SEARCH=true
+      - WEB_SEARCH_ENGINE=searxng
+      - SEARXNG_QUERY_URL=http://127.0.0.1:8888/search?q=<query>
+      - WEB_SEARCH_RESULT_COUNT=5
+      - WEB_SEARCH_CONCURRENT_REQUESTS=10
+      - ENABLE_SEARCH_QUERY_GENERATION=true
+      # Playwright loader handles cookie-consent walls (Guardian, BBC,
+      # most EU/UK news) + JS-rendered SPAs that the default requests-
+      # based loader can't navigate. Upstream start.sh sees this and
+      # runs `playwright install chromium` if the cache is empty. We
+      # mount a host volume below to persist the ~130 MB Chromium across
+      # container recreates.
+      - WEB_LOADER_ENGINE=playwright
     volumes:
       - ./storage/open-webui:/app/backend/data
+      # Persisted Playwright browser cache (Chromium-headless-shell).
+      # Without this, every `docker compose up --force-recreate` would
+      # re-download ~130 MB. Empty on first start → start.sh installs.
+      - ./storage/open-webui-playwright:/root/.cache/ms-playwright
+      # Surgical upstream-bug patch wrapper (allow_redirects dup-kwarg).
+      - ./scripts/open-webui-entrypoint.sh:/usr/local/bin/open-webui-entrypoint.sh:ro
     depends_on:
       rag-server:
         condition: service_healthy
+
+  # SearXNG — self-hosted metasearch engine. Open WebUI's native Web Search
+  # feature calls /search?format=json against this when a chat has the globe
+  # icon enabled. Aggregates Google/Bing/DDG + Wikipedia/arXiv/GitHub/Stack
+  # Exchange + news engines per the curated list in ./searxng/settings.yml.
+  #
+  # Bridge networking + ports: 8888:8080 because the container binds
+  # 0.0.0.0:8080 internally; Open WebUI (host network) reaches it at
+  # 127.0.0.1:8888. Same shape as sd-webui (port-mapped, not host-net).
+  #
+  # No depends_on to/from any other service — Open WebUI degrades gracefully
+  # when SearXNG isn't yet up (Web Search calls fail until ready, same
+  # pattern as rag-server treating reranker as best-effort).
+  #
+  # NOT LAN-exposed by design — chroma (8000) and reranker (8008) are also
+  # internal-only. See design.md §9 LAN access.
+  searxng:
+    image: searxng/searxng:latest
+    container_name: local-llm-searxng
+    restart: unless-stopped
+    ports:
+      - "8888:8080"
+    volumes:
+      - ./searxng:/etc/searxng:rw
+    environment:
+      - SEARXNG_BASE_URL=http://127.0.0.1:8888/
+      # Read from .env at the project root. The container's entrypoint will
+      # auto-generate a key if blank, but the warning logs noise — set it
+      # once via `openssl rand -hex 32` and persist in .env (gitignored).
+      - SEARXNG_SECRET=${SEARXNG_SECRET:-}
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://127.0.0.1:8080/healthz || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
 
   # Stable Diffusion WebUI (Automatic1111) — image-generation backend that
   # Open WebUI's per-message "image" button hits. Heavy first boot (clones

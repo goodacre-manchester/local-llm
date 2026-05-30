@@ -122,6 +122,11 @@ main() {
   else
     log "reranker: still booting in background (rag-server degrades gracefully if it's not ready yet)"
   fi
+  if curl -fsS --max-time 3 http://127.0.0.1:8888/healthz >/dev/null 2>&1; then
+    log "searxng (web search): ready"
+  else
+    log "searxng (web search): still booting in background (Open WebUI Web Search will fail until ready)"
+  fi
 
   # Keep this process alive so WSL remains Running and Docker stays reachable
   # from Windows.  WSL auto-terminates when no user-space session is open (even

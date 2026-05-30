@@ -2,9 +2,11 @@
 
 This file lists what is unfinished or unresolved in the current project. Project description: [README.md](README.md). Build / operate runbook: [design.md](design.md). Benchmark evidence and per-configuration scoring: `scripts/benchmark/BENCHMARK-RESULTS.md`.
 
-## Project policy: local-only
+## Project policy: local-only inference
 
-The stack is local-only. No cloud LLM fallback is planned. The local/private boundary is a hard constraint, not a tunable.
+All inference (chat models, embedders, reranker, image generator, vector store) runs locally. No cloud LLM fallback is planned. The local/private boundary for *inference* is a hard constraint, not a tunable.
+
+**Scoped egress: web grounding.** When the per-chat Web Search globe is toggled on, the self-hosted SearXNG aggregates queries to external search engines and Open WebUI fetches the resulting pages via headless Chromium. The egressed payload is the (LLM-rephrased) search query string + page-fetch requests — *not* chat history or PDF-corpus content. The chat model itself never crosses the network. Web Search is opt-in per chat; default-off models remain fully local.
 
 ## Acknowledged limitation: contrastive-recall ceiling
 

@@ -177,7 +177,10 @@ def _clone_or_pull(url: str, dest: Path, ref: str | None,
         _git(clone_args)
         if sparse_paths:
             _git(["config", "core.sparseCheckoutCone", "false"], cwd=dest)
-            _git(["sparse-checkout", "set"] + sparse_paths, cwd=dest)
+            # --skip-checks lets us mix directories with individual file
+            # paths + globs. Without it, git 2.43+ rejects non-directory
+            # entries even in non-cone mode ("'X' is not a directory").
+            _git(["sparse-checkout", "set", "--skip-checks"] + sparse_paths, cwd=dest)
     else:
         print("  git fetch + reset (existing clone)", flush=True)
         fetch_ref = ref if ref else "HEAD"

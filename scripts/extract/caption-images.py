@@ -60,31 +60,36 @@ CTX_PAGES   = int(os.environ.get("CAPTION_CTX_PAGES", "2"))
 # IO doesn't dominate.
 CHECKPOINT_EVERY = int(os.environ.get("CAPTION_CHECKPOINT_EVERY", "25"))
 
-# Locked-in v2-ctx prompt from the 2026-05-25 Phase F smoke. Lives here
-# (not imported from _smoke_vlm.py) so the production captioner is
-# decoupled from the dev harness — changes to the smoke harness's
-# prompt iteration shouldn't silently change production captions.
-PROMPT_V2_CTX_TEMPLATE = (
-    "Respond in English. Each line of your output is one complete "
-    "sentence stating one fact the diagram communicates: typically a "
-    "relationship between two named components (X provides Y to Z, X "
-    "contains Y, X is connected to Y), a constraint on a component, "
-    "or a property a component has.\n\n"
-    "The image is a technical diagram from a specification document. The "
-    "reference text below is from the same section — use it to spell "
-    "component names and acronyms exactly as they appear there. Do not "
-    "invent alternative spellings or expansions. Do not repeat facts that "
-    "are already explicitly stated in the reference text. Do not analyse "
-    "consistency between the diagram and the reference.\n\n"
+# v3-ctx prompt: stricter than v2 about not referring to the grounding
+# text. v2 produced captions that leaked phrases like "consistent with
+# the reference text", "as mentioned in the reference", "directly
+# supporting the reference text's mention of X" — 70% of v2 captions
+# (577/825) contained "reference text". v3 reframes the grounding text
+# as purely internal terminology lookup and explicitly forbids the
+# leak phrases. (Prior v2-ctx wording archived in git history.)
+PROMPT_V3_CTX_TEMPLATE = (
+    "The image is a technical diagram from a specification document.\n\n"
+    "Your task: state facts the diagram communicates. Each line of your "
+    "output is one complete sentence (e.g. X provides Y to Z, X contains "
+    "Y, X is connected to Y, X has property P, X is constrained by C).\n\n"
+    "The caption will appear in a knowledge base alongside the spec's "
+    "text — it must read as a standalone description of the diagram "
+    "itself. Do NOT refer to any external text, paragraph, reference, "
+    "or source. Do NOT use the phrases \"reference text\", \"as stated\", "
+    "\"as mentioned\", \"consistent with\", \"shown in the diagram\", "
+    "\"shown in the figure\", \"supports\", \"confirms\", \"according "
+    "to\", \"as described in\".\n\n"
+    "The text below in <reference> is given ONLY as internal grounding "
+    "so you spell component names and acronyms correctly. Never quote "
+    "it, summarise it, compare against it, or mention it.\n\n"
     "<reference>\n{context}\n</reference>\n\n"
-    "Do not describe how the diagram is drawn — no arrows, no layout, no "
-    "spatial arrangement, no visual annotations. Do not augment with "
-    "background knowledge beyond the reference text. If a component is "
-    "labelled but its role is not in the reference text, state that the "
-    "component exists without interpreting it.\n\n"
-    "Output format: plain-text sentences, one per line. No numbered lists, "
-    "no bulleted lists, no markdown headers, no bold, no section grouping, "
-    "no introduction, no conclusion, no meta-commentary."
+    "Do not describe visual layout (arrows, position, spatial "
+    "arrangement, colour). Do not augment with knowledge beyond the "
+    "diagram and grounding text. If a component is labelled but its "
+    "role is not derivable, state only that the component exists.\n\n"
+    "Output format: plain-text sentences, one per line. No numbered "
+    "lists, no bullets, no markdown headers, no bold, no introduction, "
+    "no conclusion, no meta-commentary."
 )
 
 
@@ -208,8 +213,10 @@ def _restrip_sidecar(sidecar_path: Path) -> dict:
 
 
 def _process_sidecar(sidecar_path: Path, collection_folder: Path,
-                     force: bool) -> dict:
-    """Caption every picture block in one sidecar. Returns a stats dict."""
+                     force: bool, remaining_budget: int | None = None) -> dict:
+    """Caption every picture block in one sidecar. Returns a stats dict.
+    If remaining_budget is set, stop after that many captions and report
+    captioned in stats so the caller can decrement its global budget."""
     d = json.loads(sidecar_path.read_text("utf-8"))
     blocks = d.get("blocks", [])
     pics = [(i, b) for i, b in enumerate(blocks) if b.get("type") == "picture"]
@@ -224,6 +231,8 @@ def _process_sidecar(sidecar_path: Path, collection_folder: Path,
     pic_count = len(pics)
 
     for nth, (pic_idx, pic) in enumerate(pics, 1):
+        if remaining_budget is not None and captioned >= remaining_budget:
+            break
         if pic.get("vlm_description") and not force:
             skipped += 1
             continue
@@ -242,7 +251,7 @@ def _process_sidecar(sidecar_path: Path, collection_folder: Path,
             continue
 
         context = _build_context(blocks, pic_idx, CTX_CHARS)
-        prompt = PROMPT_V2_CTX_TEMPLATE.format(context=context)
+        prompt = PROMPT_V3_CTX_TEMPLATE.format(context=context)
         try:
             raw, dt = _ollama_caption(img_abs.read_bytes(), prompt)
         except Exception as exc:
@@ -259,7 +268,7 @@ def _process_sidecar(sidecar_path: Path, collection_folder: Path,
         pic["vlm_description"] = stripped
         pic["vlm_description_raw"] = raw
         pic["vlm_model"] = VLM_MODEL
-        pic["vlm_prompt_id"] = "v2-ctx"
+        pic["vlm_prompt_id"] = "v3-ctx"
         # Re-build the chunkable text: caption + description, both
         # present so the RAG chunk is searchable on either signal.
         caption = (pic.get("caption") or "").strip()
@@ -299,6 +308,9 @@ def main(argv: list[str]) -> int:
     restrip_only = "--restrip-only" in argv
     only_idx = next((i for i, a in enumerate(argv) if a == "--only"), None)
     only_pdf = argv[only_idx + 1] if only_idx is not None else None
+    sample_idx = next((i for i, a in enumerate(argv) if a == "--sample"), None)
+    sample_budget: int | None = (int(argv[sample_idx + 1])
+                                 if sample_idx is not None else None)
 
     if not args:
         print(__doc__, file=sys.stderr)
@@ -336,7 +348,13 @@ def main(argv: list[str]) -> int:
                     print(f"[{collection}] {rs['file']}: "
                           f"re-stripped {rs['restripped']} block(s)", flush=True)
                 continue
-            stats = _process_sidecar(s, folder, force)
+            remaining = (sample_budget - overall["captioned"]
+                         if sample_budget is not None else None)
+            if remaining is not None and remaining <= 0:
+                print(f"[{collection}] sample budget reached "
+                      f"({sample_budget}); stopping.", flush=True)
+                break
+            stats = _process_sidecar(s, folder, force, remaining_budget=remaining)
             overall["pics"] += stats["pics"]
             overall["captioned"] += stats["captioned"]
             overall["skipped"] += stats["skipped"]
@@ -348,6 +366,8 @@ def main(argv: list[str]) -> int:
                       f"({stats['skipped']} skipped, {stats['errors']} errors, "
                       f"{stats['elapsed']:.0f}s, {avg:.1f}s/pic avg)",
                       flush=True)
+        if sample_budget is not None and overall["captioned"] >= sample_budget:
+            break
 
     overall_elapsed = time.time() - overall_start
     print(f"\nDone. pictures={overall['pics']} "

@@ -280,8 +280,19 @@ def _pair_picture_captions(parsed: list[dict]) -> tuple[list[dict], set[tuple[in
     return pictures, consumed
 
 
+# Per-axis render-time padding around Parse's detected picture bbox.
+# Parse's bbox tends to be tight horizontally (clipping last 3-4 chars
+# of axis labels / annotations) but already grabs surrounding paragraph
+# context vertically. So we pad X only and leave Y as-detected. Stored
+# sidecar bbox is NOT modified — render-only correction.
+BBOX_PAD_X_FRAC = float(os.environ.get("BBOX_PAD_X_FRAC", "0.02"))
+BBOX_PAD_Y_FRAC = float(os.environ.get("BBOX_PAD_Y_FRAC", "0.00"))
+
+
 def _rasterise_bbox(page: fitz.Page, bbox: list[float],
-                    target_long_side: int = TARGET_PX) -> bytes:
+                    target_long_side: int = TARGET_PX,
+                    x_pad_frac: float = BBOX_PAD_X_FRAC,
+                    y_pad_frac: float = BBOX_PAD_Y_FRAC) -> bytes:
     """Render the bbox-cropped region of `page` to PNG. bbox is in
     Parse's normalised 0-1 coordinates. Render zoom matches the full-
     page Parse render so figure detail (annotations, axis labels) stays
@@ -292,8 +303,13 @@ def _rasterise_bbox(page: fitz.Page, bbox: list[float],
         return b""
     zoom = target_long_side / longer
     x1, y1, x2, y2 = bbox
-    clip = fitz.Rect(x1 * r.width, y1 * r.height,
-                     x2 * r.width, y2 * r.height)
+    pad_x_pt = x_pad_frac * longer
+    pad_y_pt = y_pad_frac * longer
+    cx1 = max(0.0, x1 * r.width - pad_x_pt)
+    cy1 = max(0.0, y1 * r.height - pad_y_pt)
+    cx2 = min(r.width, x2 * r.width + pad_x_pt)
+    cy2 = min(r.height, y2 * r.height + pad_y_pt)
+    clip = fitz.Rect(cx1, cy1, cx2, cy2)
     pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom),
                           clip=clip, alpha=False)
     return pix.tobytes("png")

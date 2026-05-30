@@ -380,6 +380,13 @@ _PICTURE_MIN_PNG_BYTES = 4000   # skip icons / decorations under ~100x100
 _PICTURE_CAPTION_RE = re.compile(
     r"^\s*(Figure|Fig\.?|Table)\s+\d+", re.IGNORECASE
 )
+# Per-axis render-time padding around get_image_rects bbox. PyMuPDF's
+# image-rect hugs the raster image tightly (no breathing room) on both
+# axes, so we pad both directions. Slightly less on Y because adjacent
+# paragraph text can sit very close above/below the figure. Stored bbox
+# is NOT modified — render-only correction.
+_BBOX_PAD_X_FRAC = float(os.environ.get("BBOX_PAD_X_FRAC", "0.02"))
+_BBOX_PAD_Y_FRAC = float(os.environ.get("BBOX_PAD_Y_FRAC", "0.01"))
 
 
 def _extract_pymupdf_pictures(pdf: Path, images_dir: Path) -> list[dict]:
@@ -428,10 +435,21 @@ def _extract_pymupdf_pictures(pdf: Path, images_dir: Path) -> list[dict]:
                 continue
             # Render the bbox region (so the persisted PNG matches what
             # appears in the rendered page, including any overlays).
+            # Pad the clip rect so edge annotations are recovered; stored
+            # bbox below stays unpadded.
             try:
                 zoom = 2048 / max(page_w, page_h)
+                longer = max(page_w, page_h)
+                pad_x_pt = _BBOX_PAD_X_FRAC * longer
+                pad_y_pt = _BBOX_PAD_Y_FRAC * longer
+                clip_rect = fitz.Rect(
+                    max(0.0, rect.x0 - pad_x_pt),
+                    max(0.0, rect.y0 - pad_y_pt),
+                    min(page_w, rect.x1 + pad_x_pt),
+                    min(page_h, rect.y1 + pad_y_pt),
+                )
                 pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom),
-                                      clip=rect, alpha=False)
+                                      clip=clip_rect, alpha=False)
                 png_bytes = pix.tobytes("png")
             except Exception:
                 continue

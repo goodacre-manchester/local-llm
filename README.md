@@ -1,799 +1,184 @@
-# Local LLM Stack (WSL + Docker)
+# Local LLM + PDF RAG Stack
 
-This project runs a local LLM and PDF RAG stack on WSL with Docker. The
-production configuration uses **Nemotron-3-Nano 30B-A3B** for the `!deep`
-generation profile and **NVIDIA Nemotron Parse v1.2** for IEEE-standards
-PDF extraction (the AMD collection still uses the lighter PyMuPDF4LLM
-backend). Both choices come from the 2026-05 retrieval eval — see
-[scripts/benchmark/BENCHMARK-RESULTS.md](scripts/benchmark/BENCHMARK-RESULTS.md)
-for the per-phase comparison + rationale, and
-[NEXT-STEPS-NEMOTRON-EVAL.md](NEXT-STEPS-NEMOTRON-EVAL.md) for the
-eval-side resumption notes.
+A self-hosted chat + PDF retrieval-augmented generation stack that runs entirely on local hardware. Drop PDFs into a folder, ask questions in a browser, get cited answers grounded in the original documents — including the figures.
+
+The stack is **local-only**: no cloud LLM calls, no telemetry. Everything runs on WSL2 + Docker + Ollama on a Windows host.
+
+## Capabilities
+
+| Capability | What it does |
+|---|---|
+| **Chat** | Browser UI (Open WebUI) talking to local Ollama models. |
+| **PDF RAG** | One folder per document collection, OpenAI-compatible chat endpoint per collection. Cited answers with file + page + clause references. |
+| **Two generation profiles** | Per-request switch between fast (`gemma4:e4b`, ~50 s) and deep (`nemotron-3-nano:30b-a3b-q4_K_M`, ~2–3 min) by appending `!deep` to the collection name. |
+| **Layout-aware extraction** | Two extractor backends: PyMuPDF4LLM (CPU, fast) for datasheets; NVIDIA Nemotron Parse v1.2 (GPU) for layout-heavy standards. |
+| **Picture grounding** | Every figure in every PDF is extracted as a PNG and captioned by a vision-language model (`qwen3-vl:8b`). The captions become searchable chunk text, so questions about diagrams hit the right figure. |
+| **Hybrid retrieval** | Dense vector search (Chroma + Ollama `nomic-embed-text`) + in-process BM25, fused with Reciprocal Rank Fusion. |
+| **Cross-encoder reranker** | `bge-reranker-base` in a CPU sidecar reorders candidates so the right clause beats vocabulary-colliding distractors. |
+| **Clause-bounded chunking** | Text is packed within PDF bookmark boundaries; chunks are clause-pure (e.g. §12.29 chunks never bleed into §12.31). |
+| **Multi-query expansion** | The fast model decomposes the question into focused sub-queries for better recall. |
+| **Image generation** | Automatic1111 Stable Diffusion WebUI co-resident on the GPU; click the image button on any chat reply to render an SDXL image. |
+| **Editor integration** | An MCP server (`scripts/rag-mcp`) exposes the RAG collections as tools (`query_pdfs`, `list_collections`, …) for IDEs. |
+| **LAN access** | Four ports (chat UI, image gen UI, RAG API, Ollama API) can be opened to the local network with a single Windows Firewall rule. |
+| **Self-restarting** | Windows Startup-folder launcher brings the stack up on every logon; containers use `restart: unless-stopped`. |
 
 ## Services and URLs
 
-After startup, the following endpoints are available from Windows:
+After startup, from Windows:
 
-- Open WebUI chat interface: http://localhost:8080
-- Ollama API: http://localhost:11434
-- RAG server health: http://localhost:3000/health
-- Chroma heartbeat: http://localhost:8000/api/v1/heartbeat
-- Stable Diffusion WebUI (Automatic1111): http://localhost:7860
+| URL | Service |
+|---|---|
+| http://localhost:8080 | Open WebUI chat |
+| http://localhost:11434 | Ollama API |
+| http://localhost:3000/health | RAG server health |
+| http://localhost:3000/v1/models | RAG model list (one entry per collection + `!deep` variants) |
+| http://localhost:8000/api/v1/heartbeat | Chroma heartbeat |
+| http://localhost:7860 | Stable Diffusion WebUI |
 
-## What each service does
+## Installation
 
-- Ollama (`11434`): model runtime and embedding API.
-- Open WebUI (`8080`): browser chat interface connected to Ollama.
-- RAG server (`3000`): PDF ingestion and retrieval endpoints.
-- Chroma (`8000`): vector database for document embeddings.
-- sd-webui (`7860`): Automatic1111 Stable Diffusion WebUI; Open WebUI's per-message "image" button POSTs prompts here (see [Image generation (Automatic1111)](#image-generation-automatic1111)).
+For a full new-machine install (WSL, Docker, Ollama, models, GPU plumbing, autostart), see **[design.md](design.md)** — it is the runbook for reproducing this stack from a fresh clone.
 
-## Prerequisites
-
-- WSL2 Ubuntu with GPU passthrough working (Ollama uses the GPU natively).
-- Docker Engine and Compose plugin installed in WSL.
-- **NVIDIA Container Toolkit** installed in Docker — required by the
-  `sd-webui` container's GPU reservation. Bundled with Docker Desktop;
-  on hand-installed `docker-ce` in WSL it must be added once (see
-  [design.md §6.5](design.md)). Verify with:
-  ```powershell
-  wsl -e bash -lc "sudo docker run --rm --gpus all nvidia/cuda:12.4.1-base-ubuntu22.04 nvidia-smi"
-  ```
-- Ollama installed in WSL.
-
-Reference runbook: see [design.md](design.md) for full machine provisioning,
-architecture decisions, and the new-machine quick-start sequence in §13.1.
-
-## Start / Stop / Restart
-
-All scripts live in `scripts/` and work from any PowerShell terminal.
-
-**Start (or recover after a reboot):**
+The short version, assuming WSL2 / Docker / Ollama / NVIDIA Container Toolkit are already present:
 
 ```powershell
+# 1. Pull all required models (and the optional model library)
+.\scripts\wsl-run.ps1 "chmod +x scripts/bootstrap-models.sh && ./scripts/bootstrap-models.sh"
+
+# 2. Download the default SDXL checkpoint
+.\scripts\download-sd-models.ps1
+
+# 3. Install MCP server deps
+.\scripts\wsl-run.ps1 "cd scripts/rag-mcp && npm install"
+
+# 4. Install the Windows Startup-folder launcher
+.\scripts\install-startup-launcher.ps1
+
+# 5. First start
 .\scripts\start-local-llm.ps1
 ```
 
-This brings up Ollama, Docker, and all containers, then waits for every health endpoint before returning.
+Every subsequent Windows logon brings the stack up automatically.
 
-**Stop everything:**
+## Daily Usage
+
+### Chat
+
+Open http://localhost:8080. Create the admin account on first run, then pick a model from the selector:
+
+- Direct Ollama models (`gemma4:e4b`, `nemotron-3-nano:30b-a3b-q4_K_M`, `llama3.1:8b-instruct-q8_0`, …) for general chat.
+- RAG collection models (`ieee`, `amd`, `rag-active`) for grounded answers from your PDFs. See "PDF RAG" below for the one-time connection setup.
+
+Stop / start / restart:
 
 ```powershell
 .\scripts\stop-local-llm.ps1
+.\scripts\start-local-llm.ps1
+.\scripts\restart-local-llm.ps1                 # all services
+.\scripts\restart-local-llm.ps1 open-webui      # one service
 ```
 
-**Restart all services:**
+### PDF RAG
 
-```powershell
-.\scripts\restart-local-llm.ps1
-```
+Each immediate subfolder of `data/` is a **collection** (`data/ieee/`, `data/amd/`). One-time browser setup:
 
-**Restart a single service** (e.g. open-webui):
+1. http://localhost:8080 → **Settings → Connections → OpenAI API → Add connection**
+2. URL: `http://127.0.0.1:3000/v1`
+3. API key: `local` (or whatever `RAG_API_KEY` is set to, if you set one)
 
-```powershell
-.\scripts\restart-local-llm.ps1 open-webui
-```
+The model selector then lists `ieee`, `amd`, `rag-active`, plus `*!deep` variants. Select a collection model and ask questions normally. Replies cite sources inline as `[n]` and end with a **Sources** list of file, page, and section.
 
-Check running containers and health:
+**Switching the deep / fast profile per request:**
 
-```powershell
-wsl -e bash -lc "sudo docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'"
-```
+- In Open WebUI: select `<collection>!deep` from the model dropdown.
+- Via the API: set `"model": "<collection>!deep"` in the chat completion body.
+- Via the MCP `query_pdfs` tool: pass `deep: true`.
 
-## Pull required models
-
-```powershell
-.\scripts\wsl-run.ps1 "chmod +x scripts/bootstrap-models.sh && ./scripts/bootstrap-models.sh"
-```
-
-Models pulled by default:
-
-- `gemma4:e4b`  (Google Gemma 4 edge, ~9.6GB — fits 16GB VRAM fully; current `CHAT_MODEL` default — fast profile)
-- `nemotron-3-nano:30b-a3b-q4_K_M` (NVIDIA Nemotron 3 Nano, nemotron_h_moe hybrid Transformer-Mamba MoE, 31.6B / 3B active per token, reasoning-tuned; ~24GB at Q4_K_M, partial spillover on 16GB cards; **current `CHAT_MODEL_DEEP` default** — promoted 2026-05 after the eval showed −24% median latency vs the previous dense 32B at comparable answer quality)
-- `nomic-embed-text` (embedding model used by the RAG server)
-
-Optional models for direct chat (not wired into the RAG hot path; useful in Open WebUI's selector for general chat / code-gen outside the `<collection>` flow):
-
-- `llama3.1:8b-instruct-q8_0`
-- `deepseek-r1:14b` (reasoning-tuned, mid-weight)
-- `gemma4:26b` (Gemma 4 MoE, ~18GB — 4B active params/token; CPU-offloads on 16GB)
-- `qwen3.6:27b` (Qwen 3.6 dense, Apr 2026, Apache 2.0; ~17GB at Q4_K_M; hybrid-thinking, 256K-1M context)
-- `qwen3.6:35b-a3b` (Qwen 3.6 MoE, 35B total / 3B active per token; ~24GB at Q4_K_M, partial spillover)
-
-The eval found Qwen 3.6 unviable as a RAG `!deep` default on 16GB VRAM (>700s/prompt; MoE compute on partial CPU-spill is the bottleneck) — they're kept around for direct chat where the wait is acceptable, but the RAG default landed on Nemotron-3-Nano. Any of the optional models can still be invoked per-request via the literal-override syntax: `ieee!qwen3.6:35b-a3b` in the OpenAI `model` field, `query_pdfs` MCP tool's `profile` arg, etc.
-
-### Generation model & answer tuning
-
-**Two model profiles, switch per request — no restart:**
-
-- **fast** (`CHAT_MODEL`, default `gemma4:e4b`) — GPU-resident, ~50 s,
-  honest about doc gaps. Used when the model field has no suffix.
-- **deep** (`CHAT_MODEL_DEEP`, default `nemotron-3-nano:30b-a3b-q4_K_M`) — best
-  accuracy on hard technical questions. MoE 3B-active / 30B-total, ~24 GB
-  at Q4_K_M with ~8 GB system-RAM spillover on 16 GB cards. ~2-3 min per
-  deep query — about **24% faster than the previous `qwen2.5-coder:32b`
-  default** at comparable quality (the active-params advantage offsets the
-  spill penalty). Request it by appending `!deep` to the collection:
-  `amd!deep`, `ieee!deep`, `rag-active!deep`.
-
-In Open WebUI the model picker lists both per collection (e.g. `amd` and
-`amd!deep`). Via the API set `"model": "amd!deep"`. Via the MCP
-`query_pdfs` tool pass `deep: true`. `<collection>!<ollama:tag>` also works
-as a literal one-off model override.
-
-Changing the *defaults* (`CHAT_MODEL` / `CHAT_MODEL_DEEP` in
-`docker-compose.yml`) needs a container recreate:
-`wsl -e bash -lc "cd <repo> && sudo docker compose up -d rag-server"`
-(a plain `restart` does **not** pick up env changes).
-
-Other answer knobs (see `.env.example` / design.md §5.1, §5.3):
-
-- `RAG_GROUNDING=augmented` — sources are primary and cited, but the model
-  may add general expertise for gaps, tagged and never falsely cited
-  (NotebookLM-like). `strict` = sources only, maximum provenance.
-- `CHAT_NUM_CTX=12288` — context window; too small silently truncates the
-  retrieved sources and causes weak/abstaining answers.
-- `TOP_K_RESULTS=8` — retrieved chunks fed to the model.
-- `QUERY_EXPANSION=true` / `MAX_SUBQUERIES=5` — fast model decomposes the
-  question into focused sub-queries for multi-query retrieval.
-
-### Cloud generation hybrid (Gemini `!deep`) — planned, not implemented
-
-After exhaustive local tuning (structure-aware chunking, hybrid retrieval,
-dedupe + canonical preference, cross-encoder reranker, bookmark clause-path
-metadata, clause-bounded chunking, deep MoE generation, multi-query expansion,
-Nemotron Parse extraction) **one failure class still remains**: contrastive
-standards questions where vocabulary collisions starve first-stage retrieval.
-Concretely, the `tas-vs-psfp-1` benchmark prompt — phrased around "PSFP
-stream gate / IPV" — never recalls the TAS-defining `§12.29` / `§8.6.9`
-chunks, because resolving the disambiguation requires *knowing* that
-TAS ⇒ scheduled-traffic / Qbv / Clause 12.29 — domain knowledge the local
-generation **and** query-expansion models don't reliably have.
-
-The 2026-05 eval explicitly tested swapping the local retrieval components
-to NVIDIA's `llama-nemotron-embed-vl-1b-v2` + `rerank-1b-v2`. Result:
-**rejected** — the multimodal embedder lost cross-chapter recall on this
-corpus and the rerank correctly deprioritised the `§12.29.1` config-tables
-chunk for the broader question, regressing the benchmark vs the
-nomic-embed + bge-reranker baseline. See `scripts/benchmark/BENCHMARK-RESULTS.md`
-for the full per-phase comparison. NotebookLM/Gemini still gets this class
-right because Gemini has the domain knowledge plus very large context; the
-Gemini `!deep` hybrid remains the planned next step. See
-[NEXT-STEPS.md](NEXT-STEPS.md) and design.md §5.4 for the full evidence
-trail and the planned implementation.
-
-**Planned design** (uses the existing switchable `!profile` architecture):
-
-| Profile | Backend | Privacy | Cost | Use |
-|---|---|---|---|---|
-| `ieee` (fast, default) | **local `gemma4:e4b`** | fully private | free | everyday, lookups |
-| `ieee!deep` | local Nemotron-3-Nano (current) → **Gemini paid key** (planned, e.g. 2.x Pro) | local Nemotron: fully private. Gemini: no-training data terms | local: free / Gemini: per-token | local Nemotron handles most deep questions; Gemini reserved for the residual contrastive failure class (e.g. `tas-vs-psfp-1`) |
-| `ieee!gflash` (optional) | **Gemini free-tier key** (Flash) | **used by Google for improvement — not private** | free (rate-limited) | zero-cost trialing only |
-
-Local retrieval / embeddings / Chroma / grounding / citations stay on-box;
-only the chosen Gemini profile's generation call egresses. Implementation is
-contained: a Gemini provider in `server.js` keyed off the resolved profile,
-plus `GEMINI_API_KEY` / `GEMINI_MODEL` env (per profile). This is a deliberate
-local-→-cloud line-cross — left as a conscious decision for later rather
-than enabled by default.
-
-## Image generation (Automatic1111)
-
-Open WebUI has native image-generation support. With the `sd-webui` service in
-[docker-compose.yml](docker-compose.yml) wired in, any assistant reply in the
-chat gets a small **image** (picture) button — click it and the assistant's
-text is sent as a prompt to the local Stable Diffusion WebUI, which renders an
-image and inlines it into the conversation. No LLM-side "create image"
-protocol is needed; the LLM just produces a normal text reply and Open WebUI
-treats the click as a separate text→image dispatch.
-
-### The five things that must be in place
-
-If anything below is missing or skipped, image generation either doesn't work
-or fails silently. Each step links to its detailed subsection below.
-
-| # | What | Where | Done once per |
-|---|---|---|---|
-| 1 | **NVIDIA Container Toolkit** in the Docker daemon | [design.md §6.5.1](design.md) | Machine |
-| 2 | **SDXL checkpoint on disk** (`.safetensors` in the host model dir) | [§1 below](#1-download-a-base-model-66-gb) | Once |
-| 3 | **sd-webui container running + first boot complete** (incl. Blackwell torch upgrade on RTX 50-series) | [§2 below](#2-start-the-service-fully-automatic) | Auto on every boot |
-| 4 | **Open WebUI backend wired** to `http://127.0.0.1:7860` (pre-set via env; verify in Settings → Images) | [§3 below](#3-wire-open-webui-to-it) | Once (env-driven) |
-| 5 | **A chat trigger turned on** (Integrations → Images, per-message button, or tool calling) — Open WebUI does NOT auto-route based on LLM reply content | [§4 below](#4-generate-images-from-chat) | Per chat / per click |
-
-Step 5 is the one most users miss — the LLM emitting "I'll create an image…"
-or DALL·E-shaped JSON does **nothing** on its own. The trigger has to be
-explicit. See §4 below for the three trigger modes.
-
-### 1. Download a base model (~6.6 GB)
-
-The default checkpoint is **Juggernaut XL v9** (RunDiffusion's flagship SDXL
-fine-tune — strong general-purpose, photoreal-leaning, commercial-friendly
-licence). One-shot:
-
-```powershell
-.\scripts\download-sd-models.ps1
-```
-
-This downloads `Juggernaut-XL_v9_RunDiffusionPhoto_v2.safetensors` from
-HuggingFace into [storage/sd-webui/storage/stable_diffusion/models/ckpt/](storage/sd-webui/storage/stable_diffusion/models/ckpt/).
-Idempotent — re-runs only fetch what's missing or partial. Add more models by
-dropping any SDXL/SD1.5 `.safetensors` into the same folder and clicking
-**Settings → Reload UI** at http://localhost:7860, or just
-`docker compose restart sd-webui`.
-
-### 2. Start the service (fully automatic)
-
-`sd-webui` is part of the standard autostart chain — it's brought up by
-[scripts/ensure-services.sh](scripts/ensure-services.sh) (called by
-[start-local-llm.ps1](scripts/start-local-llm.ps1), itself called by the
-Startup-folder launcher on every Windows logon). After the one-time first
-boot, **you never need to touch it again** — `restart: unless-stopped` on
-the container plus the autostart launcher means every WSL/Windows restart
-re-activates image generation alongside chat and RAG.
-
-**First boot is slow** — the ai-dock image clones A1111, installs A1111's
-own dependencies, and downloads a default SD 1.5 checkpoint (10–15 minutes
-on a fresh host). On RTX 50-series (Blackwell) cards, the
-[scripts/sd-webui-entrypoint.sh](scripts/sd-webui-entrypoint.sh) wrapper
-additionally pip-installs `torch 2.11.0+cu128` into the A1111 venv before
-A1111 starts (adds ~3 min on first run; near-instant thereafter thanks to
-the host-mounted pip cache). See [design.md §6.5](design.md) for why this
-is needed — short version: ai-dock's image ships `torch 2.4.0+cu121` whose
-CUDA kernels only go up to `sm_90`, and RTX 50-series cards are `sm_120`.
-
-The autostart script does **not** block on first boot — chat is reachable
-immediately; the image-generation button will surface a transient error
-until first boot completes, then work on every subsequent reply. The
-autostart log prints `sd-webui (image generation): ready` once it's up.
-Subsequent boots take ~30 s.
-
-Verify it's up:
-
-```powershell
-wsl -e bash -lc "curl -fsS http://127.0.0.1:7860/sdapi/v1/options >/dev/null && echo 'sd-webui: ok'"
-```
-
-Tail first-boot progress:
-
-```powershell
-.\scripts\wsl-run.ps1 "sudo docker compose logs -f sd-webui"
-```
-
-### 3. Wire Open WebUI to it
-
-[docker-compose.yml](docker-compose.yml) pre-sets the engine env vars
-(`IMAGE_GENERATION_ENGINE=automatic1111`, `AUTOMATIC1111_BASE_URL=http://127.0.0.1:7860`,
-default model + size + steps), so for most setups **no admin-panel clicks are
-needed** — `docker compose up -d open-webui` after the env change is enough.
-
-To verify or override interactively in the browser:
-
-1. http://localhost:8080 → **Admin Panel** (top-right user menu)
-2. **Settings → Images**
-3. **Image Generation Engine:** `Default (Automatic1111)`
-4. **AUTOMATIC1111 Base URL:** `http://127.0.0.1:7860`
-5. **Default Model:** `Juggernaut-XL_v9_RunDiffusionPhoto_v2`
-   (drop-down populates from sd-webui's `/sdapi/v1/sd-models` — if it's empty,
-   the service is still booting or the model file isn't in `models/ckpt/`)
-6. **Image Size:** `1024x1024` (SDXL native — anything smaller degrades quality)
-7. **Steps:** `30` (good speed/quality balance; 50 for max quality, 20 for fast)
-8. **Save**
-
-While you're in Admin Panel, also check **Settings → Connections** for any
-stray `https://127.0.0.1:3000/v1` entry — it will spam SSL-handshake errors
-in the open-webui log against the plain-HTTP rag-server. The correct entry
-is `http://127.0.0.1:3000/v1`. Remove duplicates / fix the scheme and save.
-(If editing in the UI is awkward, [design.md §12.1](design.md) documents the
-direct SQLite cleanup recipe used during install.)
-
-### Smoke-test the backend without Open WebUI
-
-Useful when you want to know the bug is in the chat layer vs the image
-backend. Loads the default checkpoint and generates a 1024×1024 PNG to
-`d:\tmp\sd-smoke-test.png`:
-
-```powershell
-wsl -e bash -lc "curl -fsS -X POST http://127.0.0.1:7860/sdapi/v1/options \
-  -H 'Content-Type: application/json' \
-  -d '{\"sd_model_checkpoint\":\"Juggernaut-XL_v9_RunDiffusionPhoto_v2\"}' \
-  --max-time 180 && \
-  curl -fsS -X POST http://127.0.0.1:7860/sdapi/v1/txt2img \
-  -H 'Content-Type: application/json' \
-  -d '{\"prompt\":\"a single ripe red apple on a wooden table, soft window light, photorealistic\",\"steps\":20,\"width\":1024,\"height\":1024,\"sampler_name\":\"Euler a\",\"cfg_scale\":6}' \
-  --max-time 300 -o /tmp/sd-smoke.json && \
-  python3 -c 'import json,base64; png=base64.b64decode(json.load(open(\"/tmp/sd-smoke.json\"))[\"images\"][0]); open(\"/mnt/d/tmp/sd-smoke-test.png\",\"wb\").write(png); print(\"OK:\",len(png),\"bytes\")'"
-```
-
-If this returns `OK: <bytes>` and the PNG looks right, sd-webui is fully
-healthy and anything still broken is in Open WebUI's chat-trigger config (§4
-below), not the backend.
-
-### 4. Generate images from chat
-
-Open WebUI does **not** route image generation based on the LLM's response
-text — even if the model emits DALL·E-shaped JSON, OW just renders it as
-plain text. Image generation has to be triggered explicitly via one of:
-
-- **Auto-image per reply (Integrations menu — recommended for "ask, get
-  image"):** in the chat input area, click the **Integrations** icon (it's
-  the `+` / puzzle-piece button left of the message box — labelled
-  **Integrations** on newer OW versions, **More** / **+** on older ones) →
-  toggle **Images** on. From then on, every assistant reply *in that chat*
-  also runs through sd-webui and inlines a generated image below the text.
-  This is the trigger that makes natural-language requests like "create an
-  image of …" actually produce an image. Costs ~6–10 s and ~8 GB VRAM per
-  reply on SDXL — toggle it off when you don't want images.
-- **Per-message manual:** every assistant reply has an **image** icon in its
-  message toolbar — click it; the reply's text becomes the prompt; the
-  rendered image appears as a follow-up. Use when you only occasionally want
-  an image and don't want auto-gen running on every reply.
-- **Tool calling (advanced, optional):** Admin Panel → Settings → Models →
-  set **Function Calling = Native** globally, then on each model toggle the
-  **Image Generation** capability under **Capabilities** / **Default
-  Features**. With this on, the LLM emits a `generate_image` tool call
-  which OW catches and dispatches to A1111. Requires the model to do native
-  function calling reliably; not all local models do.
-
-### GPU coexistence with Ollama (16 GB card)
-
-The current config keeps both runtimes resident — CUDA juggles the VRAM:
-
-| Loaded together | Approx VRAM | Status |
-|---|---|---|
-| `gemma4:e4b` (fast) + SDXL (Juggernaut XL) | ~10 GB / 16 | comfortable headroom |
-| `gemma4:e4b` + SDXL during a generation | ~13 GB / 16 | fine, tight on activations |
-| `qwen2.5-coder:32b` (`!deep`) + SDXL | exceeds 16 GB | OOM if both active concurrently |
-
-`!deep` already CPU-offloads on a 16 GB card, so running an SDXL generation
-mid-`!deep`-answer just steals more VRAM and slows both. Practical pattern:
-use `!deep` for hard contrastive lookups, fast model for everything else, and
-image generation only on top of fast-model replies. If you hit OOM, either
-generate images between `!deep` turns rather than during them, or switch the
-checkpoint to a **Lightning** variant (4-step generation, ~3-5 s/image,
-much shorter VRAM-occupancy window).
-
-### Troubleshooting
-
-- **"I asked the model to make an image and got JSON/text back":** Open
-  WebUI does NOT route based on the LLM's reply content. The model emitting
-  DALL·E-shaped JSON or text like "I'll generate an image…" does nothing on
-  its own. You need an explicit trigger — easiest is **Integrations →
-  Images** in the chat input (§4 above). Confirm: the input box should show
-  a small **Images** chip/badge when the toggle is on.
-- **Open WebUI says "Failed to generate image":** check sd-webui logs —
-  `.\scripts\wsl-run.ps1 "sudo docker compose logs --tail=200 sd-webui"`.
-  Most common causes: model file missing from `models/ckpt/`, first boot
-  still installing, or VRAM OOM (see table above). Run the curl smoke test
-  in §3 to isolate backend vs Open WebUI.
-- **Model drop-down is empty in Admin → Images:** sd-webui is reachable
-  (`curl http://127.0.0.1:7860/sdapi/v1/options` works) but no `.safetensors`
-  is in `models/ckpt/`. Re-run `.\scripts\download-sd-models.ps1` and
-  `docker compose restart sd-webui`.
-- **Open WebUI log spams `[SSL: WRONG_VERSION_NUMBER]` against
-  `127.0.0.1:3000`:** there's a stray `https://127.0.0.1:3000/v1` entry in
-  the OpenAI connections list. Fix in Admin Panel → **Settings →
-  Connections** by removing/correcting the https entry (the rag-server is
-  plain HTTP). See [design.md §12.1](design.md) for the direct SQLite
-  cleanup recipe if the UI fights you.
-- **GPU not visible inside the container:** confirm NVIDIA Container Toolkit
-  is installed in the Docker daemon (Docker Desktop bundles it; hand-installed
-  `docker-ce` in WSL does NOT — see [design.md §6.5.1](design.md) for the
-  install procedure). Test:
-  `wsl -e bash -lc "sudo docker run --rm --gpus all nvidia/cuda:12.4.1-base-ubuntu22.04 nvidia-smi"`.
-- **"CUDA error: no kernel image is available for execution on the device"
-  in sd-webui logs:** the container's PyTorch lacks kernels for your GPU's
-  compute capability. The
-  [scripts/sd-webui-entrypoint.sh](scripts/sd-webui-entrypoint.sh) wrapper
-  upgrades to `torch 2.11.0+cu128` (covers `sm_100`/`sm_120` Blackwell) on
-  every container creation; if you see this error, the wrapper either didn't
-  run or its `pip install` failed. Check the boot log for the
-  `[sd-webui-entrypoint]` lines and confirm the wrapper file is mounted at
-  `/usr/local/bin/sd-webui-entrypoint.sh`. For non-Blackwell cards needing
-  a different arch, edit `TARGET_TORCH` in the wrapper. Full background in
-  [design.md §6.5.2](design.md).
-- **xformers warning at sd-webui startup ("xformers can't load C++/CUDA
-  extensions"):** expected and harmless. The image's bundled xformers is
-  ABI-pinned to torch 2.4.0+cu121, so it can't load against the upgraded
-  cu128 torch. We use `--opt-sdp-attention` in `WEBUI_ARGS` instead
-  (PyTorch's native scaled-dot-product attention, comparable speed). No
-  action needed.
-
-## Auto-start after reboot
-
-The startup launcher is installed in the Windows user Startup folder and runs automatically at logon:
-
-```
-C:\Users\<username>\AppData\Roaming\Microsoft\Windows\Start Menu\Programs\Startup\start-local-llm.cmd
-```
-
-To re-install it on a new machine:
-
-```powershell
-.\scripts\install-startup-launcher.ps1
-```
-
-## Use the chat interface
-
-1. Open http://localhost:8080
-2. Create your first admin account (first run only).
-3. In model selection, choose one of your pulled Ollama models.
-4. Start chatting.
-
-If no models appear, verify Ollama is running and models are present:
-
-```powershell
-wsl -e bash -lc "ollama list"
-```
-
-## Access Open WebUI from other devices on your LAN
-
-By default Open WebUI is only reachable as `http://localhost:8080` from the
-Windows host. To reach it from a phone or another PC on the same network
-(`http://<windows-lan-ip>:8080`), **two firewall layers** must allow it —
-this is specific to WSL2 mirrored networking.
-
-**Prerequisite:** WSL must be in mirrored networking mode. Check
-`%USERPROFILE%\.wslconfig` contains:
-
-```ini
-[wsl2]
-networkingMode=mirrored
-```
-
-(If you change this, run `wsl --shutdown` then `.\scripts\start-local-llm.ps1`.)
-
-**1. Find the Windows LAN IP:**
-
-```powershell
-Get-NetIPAddress -AddressFamily IPv4 |
-  Where-Object { $_.IPAddress -notlike '127.*' -and $_.IPAddress -notlike '169.*' } |
-  Select-Object IPAddress, InterfaceAlias
-```
-
-Use the Wi-Fi / Ethernet address (e.g. `192.168.0.83`), not the
-`vEthernet (WSL ...)` one.
-
-**2. Open both firewalls (PowerShell as Administrator):**
-
-Inbound LAN traffic hits the **Windows Defender Firewall** on the physical
-adapter first, then is mirrored into WSL through the **Hyper-V firewall**.
-Both block inbound by default, so you need a rule in each:
-
-```powershell
-# Layer 1 — Windows Defender Firewall (physical adapter)
-New-NetFirewallRule -DisplayName "Open WebUI 8080" -Direction Inbound `
-  -Action Allow -Protocol TCP -LocalPort 8080 -Profile Any
-
-# Layer 2 — Hyper-V firewall (WSL vNIC; {40E0AC32-...} is WSL's fixed ID)
-New-NetFirewallHyperVRule -Name "OpenWebUI-8080" -DisplayName "Open WebUI 8080" `
-  -Direction Inbound -VMCreatorId '{40E0AC32-46A5-438A-A0B2-2B479E8F2E90}' `
-  -Protocol TCP -LocalPorts 8080 -Action Allow
-```
-
-No reboot needed; the rules apply immediately.
-
-**3. Test from another device — not the Windows host.** Browse to
-`http://<windows-lan-ip>:8080` from a phone or second PC on the same network.
-
-> Testing from the Windows machine itself using its own LAN IP **will fail
-> even when LAN access is working correctly** — in mirrored mode the host
-> connecting to its own mirrored IP does not loop into WSL; only
-> `localhost`/`127.0.0.1` has the special relay. Always validate from a
-> separate device.
-
-**Troubleshooting:** if a second device still cannot connect:
-
-- Confirm both devices are on the **same network** (not a guest SSID). Some
-  routers (e.g. BT Hub) apply client/AP isolation on guest networks.
-- Confirm the active network profile is **Private**, not Public
-  (`Get-NetConnectionProfile`).
-- The LAN IP is a DHCP lease and can change on reconnect — set a DHCP
-  reservation on your router for a stable address.
-
-**Security:**
-
-- Open WebUI requires a login (`WEBUI_AUTH=true`), so LAN exposure is gated.
-- Do **not** expose the RAG server port (`3000`) the same way unless you set
-  `RAG_API_KEY` first — it is unauthenticated by default. Exposing another
-  port uses the identical two-rule procedure with that port number.
-
-## PDF RAG — Setup
-
-The RAG server organises documents into **collections**. Each subfolder under `data/` is one collection. The server detects folders automatically on startup.
-
-### 1. Add a collection folder and drop in PDFs
-
-Create a subfolder for your topic and copy PDFs into it:
-
-```
-data\
-  ieee\       ← put IEEE papers here
-  amd\        ← put AMD documentation here
-```
-
-Folders with only a `.gitkeep` placeholder are valid but empty — no indexing occurs until PDFs are present.
-
-### 2. Extract PDFs (recommended — enables tables + page citations)
-
-Convert PDFs into page-tagged JSON sidecars (`data/<collection>/.rag-cache/`).
-This preserves tables, sections, and page numbers so answers can cite
-"file.pdf — p.12, §3.2". Without this step the server falls back to flat text
-extraction (no page citations, tables flattened).
-
-Each chunk's section is taken from the PDF's **bookmark/outline tree** (the
-authoritative clause structure, e.g. `12.29.1 The Gate Parameter Table`),
-not heuristic heading detection — this both makes citations clause-exact and
-lets retrieval separate mechanisms that share vocabulary but live in
-different clauses.
-
-**Two extraction backends are supported**, chosen per collection:
-
-| Backend | Script | Cost | Use for |
-|---|---|---|---|
-| PyMuPDF4LLM (default) | `extract-pdfs.ps1` | CPU only, seconds per PDF | Datasheets / general PDFs (e.g. AMD collection). Lightweight pure-Python venv at `scripts/extract/.venv`. |
-| **NVIDIA Nemotron Parse v1.2** (recommended for layout-heavy standards PDFs) | `extract-nemo.ps1` | GPU, ~10 s/page warm | **IEEE 802.1 standards collection.** Vision-encoder layout-aware extraction — produces cleaner section-bounded chunks. +2 fixes vs PyMuPDF4LLM on the RAG benchmark (`tas-vs-psfp-2`, `clause-explicit`), 0 regressions. Heavier venv at `scripts/extract/.venv-nemo` (torch cu128 + transformers + ~6 GB pip footprint). |
-
-PyMuPDF4LLM (any collection):
-```powershell
-.\scripts\extract-pdfs.ps1            # all collections
-.\scripts\extract-pdfs.ps1 amd        # one collection
-.\scripts\extract-pdfs.ps1 amd -Force # re-extract even if unchanged
-```
-
-Nemotron Parse (`ieee` in this repo's reference config):
-```powershell
-.\scripts\extract-nemo.ps1 ieee                       # full IEEE corpus (~hours)
-.\scripts\extract-nemo.ps1 ieee -Force                # re-extract even if unchanged
-$env:NEMO_PARSE_PAGES = "203-238,480-482"             # slice extraction (per-PDF page ranges)
-.\scripts\extract-nemo.ps1 ieee-nemo-parse-tas        # extract just that slice
-Remove-Item Env:NEMO_PARSE_PAGES
-```
-
-Both scripts skip unchanged PDFs by source mtime; `-Force` re-extracts.
-Sidecar shape is identical between backends (`backend` field differs:
-`"pymupdf4llm"` vs `"nemotron-parse-v1.2"`); `app/server.js`'s
-`loadSidecar` / `chunkBlocks` consume both interchangeably, so you can
-mix backends across collections without rag-server code changes.
-
-First run of `extract-pdfs.ps1` creates `scripts/extract/.venv` and
-installs PyMuPDF4LLM. Needs `python3-venv` in WSL once:
-```powershell
-wsl -e bash -lc "sudo apt-get install -y python3-venv"
-```
-
-First run of `extract-nemo.ps1` creates `scripts/extract/.venv-nemo` and
-installs torch 2.x+cu128 (Blackwell sm_120 ready) + transformers +
-open_clip_torch + albumentations (~6 GB). Also downloads Parse model
-weights (~3.75 GB) into `storage/nemo-parse/hf-cache/` on first
-extraction call. Free the GPU first if other services are using it
-(`sudo docker compose stop sd-webui` — Parse + SDXL can't co-resident
-on 16 GB).
-
-For best quality on dense datasheets via the PyMuPDF4LLM path, also
-`pip install docling` into `.venv` — `extract.py` picks it up
-automatically.
-
-### 3. Ingest a collection
-
-Ingest must be triggered once after extracting (or after adding/replacing PDFs). Unchanged files are skipped automatically on subsequent calls.
-
-```powershell
-# Ingest the ieee collection
-wsl -e bash -lc "curl -fsS -X POST http://127.0.0.1:3000/collections/ieee/ingest"
-
-# Ingest the amd collection
-wsl -e bash -lc "curl -fsS -X POST http://127.0.0.1:3000/collections/amd/ingest"
-```
-
-Ingest reads the sidecar if present (structure-aware chunks: tables kept
-whole, page/section metadata). Retrieval is **hybrid** — dense vector search
-fused with BM25 keyword search via Reciprocal Rank Fusion — so exact
-identifiers (register names, `0x04`, `AXI_INTC`) are found, not just
-semantically-similar prose. Cross-document duplicates (consolidated standard
-vs. its amendments vs. ISO reprint) are collapsed with a preference for the
-canonical source, then a **cross-encoder reranker** (the `reranker` container)
-reorders candidates so the right clause beats vocabulary-colliding
-distractors — e.g. IEEE 802.1Q *TAS transmission gate* (Clause 12.29) no
-longer pulls *PSFP stream gate* (Clause 12.31) chunks. The reranker is
-best-effort: if its container is down or still loading (first boot installs
-torch + downloads the model, several minutes), retrieval transparently falls
-back to fused order. Answers are grounded: the model is instructed to
-answer only from retrieved sources, cite them inline with `[n]`, and abstain
-when the sources don't cover the question. Every reply ends with a **Sources**
-list (file, page, section).
-
-> Citation rendering in Open WebUI: because the RAG server is an *external*
-> OpenAI connection, citations appear as the inline `[n]` markers + the
-> Sources list in the message body (Open WebUI's native citation chips are
-> tied to its own built-in RAG, not external models). The MCP `query_pdfs`
-> tool returns the same cited answer text.
-
-### 4. Set the active collection
-
-The active collection is used by default when no collection is specified in a request. Switching is instant — no re-indexing.
+**Switching the active collection** (used by `rag-active`):
 
 ```powershell
 wsl -e bash -lc "curl -fsS -X PUT http://127.0.0.1:3000/active-collection -H 'Content-Type: application/json' -d '{\"name\":\"ieee\"}'"
 ```
 
-### 5. Adding a new collection — end-to-end checklist
-
-The §1-4 sections above describe each piece independently. For a brand-new
-`data/<newname>/` collection, the practical sequence is:
+**Query directly via the API:**
 
 ```powershell
-# 1. Create the folder and drop PDFs in
-mkdir d:\Projects\local-llm\data\<newname>
-copy <pdfs> d:\Projects\local-llm\data\<newname>\
-
-# 2. Extract BEFORE first ingest. Pick the backend based on PDF layout:
-#    - Datasheets / single-column UGs / RFCs / textbooks  → PyMuPDF4LLM (CPU, fast)
-#    - Standards / dense-table specs / layout-heavy docs  → Nemotron Parse (GPU, hours)
-
-# 2a. PyMuPDF4LLM path:
-.\scripts\extract-pdfs.ps1 <newname>
-
-# 2b. OR Nemotron Parse path (pause sd-webui first to free GPU):
-wsl -e bash -lc "sudo docker compose stop sd-webui"
-.\scripts\extract-nemo.ps1 <newname>
-wsl -e bash -lc "sudo docker compose start sd-webui"
-
-# 3. Trigger ingest. (rag-server's AUTO_INGEST will also run on next
-#    container recreate, but explicit is faster and clearer.)
-wsl -e bash -lc "curl -fsS -X POST http://127.0.0.1:3000/collections/<newname>/ingest"
-
-# 4. (Optional, recommended) Render readable .md views for IDE preview:
-.\scripts\dump-sidecar-md.ps1 <newname>
-
-# 5. Recreate rag-server so /v1/models advertises the new collection in
-#    Open WebUI's selector:
-wsl -e bash -lc "cd /mnt/d/Projects/local-llm && sudo docker compose up -d rag-server --force-recreate"
+wsl -e bash -lc "curl -fsS -X POST http://127.0.0.1:3000/query -H 'Content-Type: application/json' -d '{\"query\":\"what is the gate parameter table?\",\"collection\":\"ieee\",\"topK\":5}'"
 ```
 
-Open WebUI's model dropdown will now show `<newname>` (fast profile) and
-`<newname>!deep`. You can use them per-request or `PUT /active-collection`
-to set the new collection as the default (step 4 above).
-
-**Why "extract before first ingest" matters:** if rag-server's
-`AUTO_INGEST` runs before any sidecar exists (e.g. you create the folder
-and then `docker compose up -d rag-server` without extracting first),
-ingest falls back to flat `pdf-parse` text — readable, but no page
-numbers, no clause-bounded chunks, tables flattened. The fallback logs
-loudly (`[ingest] FLAT pdf-parse fallback (no pages/sections)`) so it
-won't degrade silently, and the next post-extract ingest cleanly
-overwrites the flat chunks. The simplest way to avoid the wasted round
-is the sequence above: extract → ingest → recreate.
-
-**Per-collection extractor decision** — there's no auto-detection. The
-choice between PyMuPDF4LLM and Parse is a per-collection operator call
-based on the PDF type (see "PDF RAG — Setup §2" above for the
-backend comparison + the eval evidence behind the IEEE→Parse,
-AMD→PyMuPDF4LLM defaults).
-
-Check which collection is currently active:
-
-```powershell
-wsl -e bash -lc "curl -fsS http://127.0.0.1:3000/active-collection"
-```
-
-List all collections and their ingest status:
-
-```powershell
-wsl -e bash -lc "curl -fsS http://127.0.0.1:3000/collections"
-```
-
----
-
-## PDF RAG — Query from the browser (Open WebUI)
-
-The RAG server exposes an OpenAI-compatible endpoint. Open WebUI can connect to it as a second model source, making each collection appear as a selectable model.
-
-**One-time setup:**
-
-1. Open http://127.0.0.1:8080 and sign in.
-2. Go to **Settings → Connections**.
-3. Under **OpenAI API**, click **Add connection** and enter:
-   - **URL:** `http://127.0.0.1:3000/v1`
-   - **API key:** `local` (any non-empty value, unless `RAG_API_KEY` is set — see below)
-4. Save. The model selector now shows `ieee`, `amd`, and `rag-active` alongside your Ollama models.
-
-> **Authentication:** By default the RAG server is unauthenticated and CORS is
-> restricted to localhost (single-user, local-only use). To require a key, set
-> `RAG_API_KEY=<secret>` in the `rag-server` environment (`docker-compose.yml`
-> or `.env`) and restart it. Then use that exact value as the Open WebUI
-> connection API key, and set the same `RAG_API_KEY` for the MCP server.
-> `/health` stays open so the Docker healthcheck keeps working.
-
-**Chatting with a collection:**
-
-- Select **`ieee`** to always query the IEEE collection regardless of active-collection state.
-- Select **`amd`** to always query the AMD collection.
-- Select **`rag-active`** to query whichever collection is currently set as active.
-
-Type your question normally. The RAG server retrieves the most relevant document chunks and passes them to the LLM as context before answering.
-
----
-
-## PDF RAG — Query from the API
-
-**Query the active collection:**
-
-```powershell
-wsl -e bash -lc "curl -fsS -X POST http://127.0.0.1:3000/query -H 'Content-Type: application/json' -d '{\"query\":\"summarize the proposed architecture\",\"topK\":5}'"
-```
-
-**Query a specific collection by name:**
-
-```powershell
-wsl -e bash -lc "curl -fsS -X POST http://127.0.0.1:3000/query -H 'Content-Type: application/json' -d '{\"query\":\"what power states are supported?\",\"collection\":\"amd\",\"topK\":5}'"
-```
-
-**Full RAG chat via OpenAI-compatible endpoint** (e.g. for MCP clients or scripts):
+**OpenAI-compatible chat completion** (streaming supported via `"stream": true`):
 
 ```powershell
 wsl -e bash -lc @'
 curl -fsS -X POST http://127.0.0.1:3000/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{
-    "model": "ieee",
-    "messages": [{"role": "user", "content": "What is the key contribution of the paper?"}]
+    "model": "ieee!deep",
+    "messages": [{"role": "user", "content": "Summarise Clause 12.29 — the Gate Parameter Table."}]
   }'
 '@
 ```
 
-The `model` field selects the collection: `ieee`, `amd`, or `rag-active`.
+### Adding PDFs to a collection
 
-**Streaming responses** are supported — add `"stream": true` to the request body.
-
-The `topK` field is honoured here too — add `"topK": 8` to retrieve more context chunks.
-
-## PDF RAG — Query from the editor (MCP)
-
-`scripts/rag-mcp/` is a stdio MCP server exposing the RAG collections as editor
-tools (`query_pdfs`, `list_collections`, `set_active_collection`,
-`ingest_collection`). It is registered via [.vscode/mcp.json](.vscode/mcp.json).
-
-**One-time setup** — install its dependencies (not auto-installed, unlike the
-containerised RAG server):
+Drop PDFs into `data/<collection>/` (create the folder if new), then run extract → caption → ingest. Full procedure including extractor choice in **[design.md §7](design.md)**. Short version:
 
 ```powershell
-.\scripts\wsl-run.ps1 "cd scripts/rag-mcp && npm install"
+# 1. Extract (pick the backend by PDF type)
+.\scripts\extract-pdfs.ps1 <collection>      # PyMuPDF4LLM: datasheets, UGs, RFCs (fast)
+.\scripts\extract-nemo.ps1 <collection>      # Nemotron Parse: standards (GPU, hours for large PDFs)
+
+# 2. Caption every picture in every PDF in every collection
+wsl -e bash -lc "bash /mnt/d/Projects/local-llm/scripts/extract/run-caption-pipeline.sh"
+
+# 3. Ingest into Chroma
+wsl -e bash -lc "curl -fsS -X POST http://127.0.0.1:3000/collections/<collection>/ingest"
+
+# 4. (For a NEW collection) recreate rag-server so it appears in the model selector
+wsl -e bash -lc "cd /mnt/d/Projects/local-llm && sudo docker compose up -d rag-server --force-recreate"
 ```
 
-If `RAG_API_KEY` is set on the RAG server, add a matching `RAG_API_KEY` to the
-`env` block in `.vscode/mcp.json` so the MCP server can authenticate.
+If you add captions to a collection that's already been ingested, the PDF mtimes are unchanged — pass `{"force":true}` to the ingest call so it re-reads the sidecars.
 
-## Useful operational commands
-
-Tail Open WebUI logs:
+**Inspect captions** before or after ingest by opening `data/<collection>/picture-review.html` — a browser page with every figure side-by-side with its caption and raw VLM output. Rebuild it any time with:
 
 ```powershell
-.\scripts\wsl-run.ps1 "sudo docker compose logs --tail=150 open-webui"
+wsl -e bash -lc "python3 /mnt/d/Projects/local-llm/scripts/extract/build-picture-review.py /mnt/d/Projects/local-llm/data"
 ```
 
-Tail RAG server logs:
+### Image generation
 
-```powershell
-.\scripts\wsl-run.ps1 "sudo docker compose logs --tail=150 rag-server"
-```
+Open WebUI has a per-message **image** button on every assistant reply. Click it to send the reply text as a prompt to the local `sd-webui` (Automatic1111 with the Juggernaut XL v9 SDXL checkpoint by default). The rendered image is inlined into the conversation. Generation costs ~6–10 s and ~8 GB VRAM per image on SDXL.
 
-Check health of all containers:
+Other trigger modes (auto-image per reply, tool calling) and the SDXL backend details are in **[design.md §10.6](design.md)**.
 
-```powershell
-wsl -e bash -lc "sudo docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'"
-```
+### Editor integration (MCP)
 
-Start the Nemotron embed+rerank sidecar (host-side, manual — only for
-re-benching the Phase 4 retrieval components against a future Nemotron
-release; not part of the production hot path):
+`scripts/rag-mcp/` is a stdio MCP server registered in `.vscode/mcp.json`. Tools: `query_pdfs`, `list_collections`, `set_active_collection`, `ingest_collection`. The `query_pdfs` tool takes a `deep` boolean for the deep profile.
 
-```powershell
-wsl -e bash -lc "cd /mnt/d/Projects/local-llm/scripts/extract && \
-  . .venv-nemo/bin/activate && \
-  export HF_HOME=/mnt/d/Projects/local-llm/storage/nemo-parse/hf-cache && \
-  python /mnt/d/Projects/local-llm/scripts/nemo-rag/server.py"
-```
+If you set `RAG_API_KEY` on the rag-server, add the same value to the `env` block of `.vscode/mcp.json`.
 
-Then opt a collection in via `NEMO_EMBED_COLLECTIONS` / `NEMO_RERANK_COLLECTIONS`
-in `docker-compose.yml` and recreate `rag-server`. See
-`scripts/benchmark/BENCHMARK-RESULTS.md` for the resumption procedure.
+### LAN access (optional)
+
+Four ports can be exposed to other devices on the LAN: `8080` (chat UI), `7860` (image gen UI), `3000` (RAG API), `11434` (Ollama API). The full procedure (WSL mirrored networking, Ollama bind change, single firewall rule, security trade-offs) is in **[design.md §9](design.md)**.
+
+## Acknowledged Limitation
+
+The local stack handles focused lookup questions and figure-grounded questions well. One failure class remains: **contrastive standards questions** where one mechanism's vocabulary dominates the question (e.g. *"is TAS the same as a PSFP stream gate?"*). First-stage retrieval pulls only PSFP chunks; the local generation model and the local query-expander both lack the domain knowledge to bridge *"TAS ⇒ scheduled-traffic / Clause 12.29"*.
+
+The chunks are correctly indexed — a `/query` probe with explicit clause wording (*"Clause 12.29"*) returns the right chunks at rank 1. The failure is purely first-stage recall on vocabulary-colliding phrasing.
+
+**Workaround:** re-ask the question with the defining clause number explicit (*"summarise Clause 12.29 — the Gate Parameter Table"*).
+
+The two credible directions for closing this gap (stronger local generator/expander, or a per-corpus domain glossary fed into expansion) are recorded in **[NEXT-STEPS.md](NEXT-STEPS.md)** alongside the polish backlog.
+
+## Pointers
+
+- **[design.md](design.md)** — runbook for rebuilding the stack on a new machine, service-by-service spec, operational reference.
+- **[NEXT-STEPS.md](NEXT-STEPS.md)** — open polish items, acknowledged limitation, levers already tried.
+- **scripts/benchmark/BENCHMARK-RESULTS.md** — regression-guard benchmark + the evaluation rationale behind the current configuration choices.
+- **docs/archive/** — historical session hand-off documents, retained for reference.
+
+## Help
+
+`/help` in Open WebUI, or open an issue on the upstream Open WebUI repo. For Claude Code itself: feedback at https://github.com/anthropics/claude-code/issues.

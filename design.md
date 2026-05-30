@@ -211,6 +211,16 @@ vLLM-served Nemotron Parse v1.2 entry. Not part of the autostart chain (no `rest
 
 Web Search also requires `WEB_LOADER_ENGINE=playwright` for cookie-walled / JS-rendered sites (Guardian, BBC, most EU/UK news). Upstream `start.sh` runs `playwright install chromium` when that env is set; the ~600 MB Chromium cache is persisted via the `./storage/open-webui-playwright:/root/.cache/ms-playwright` host volume so container recreates don't re-download.
 
+Tuned defaults wired in `docker-compose.yml` (override OW defaults which are too narrow for useful grounding):
+
+| Env var | Value | Why |
+|---|---|---|
+| `WEB_SEARCH_RESULT_COUNT` | `10` | OW default `3` is too tight — extraction drops empty pages, leaving too few sources. |
+| `WEB_SEARCH_CONCURRENT_REQUESTS` | `10` | Parallelise Playwright fetches. |
+| `RAG_TOP_K` | `5` | Top-K chunks reaching the chat model (across PDF-RAG AND web-search). OW default `3` collapses inline citations to one source. |
+| `WEB_SEARCH_DOMAIN_FILTER_LIST` | JSON exclude-list (`!youtube.com`, `!youtu.be`, `!merriam-webster.com`, `!dictionary.com`, `!quora.com`) | Skip sites that rank well but yield no usable article text. |
+| `ENABLE_SEARCH_QUERY_GENERATION` | `true` | LLM rephrases user prompt into focused sub-queries via the Task Model. |
+
 ### Common notes
 
 All six active services (`chroma`, `rag-server`, `reranker`, `open-webui`, `sd-webui`, `searxng`) use `restart: unless-stopped`. Startup ordering uses `depends_on: condition: service_healthy`. The Chroma image is pinned to `0.5.5` because `app/server.js` calls `/api/v1`, which is removed in 0.6+.

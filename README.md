@@ -166,7 +166,23 @@ Curated engines (configured in [searxng/settings.yml](searxng/settings.yml)):
 | News / current affairs | Google News, Bing News, DuckDuckGo News |
 | Reference / learning | Wikipedia, Wikidata, arXiv, GitHub, Stack Overflow, Google Scholar, Semantic Scholar |
 
-Latency budget: ~3–10 s extra per reply (search + fetch + embed). Works with any model selected in the dropdown but **not** with the PDF-RAG collection models (`ieee`, `amd`, `rag-active`) — those route through the rag-server and have their own RAG pipeline. To make web grounding default-on, create a per-model preset under **Workspace → Models** with Web Search enabled in its capabilities.
+Tuned defaults wired in [docker-compose.yml](docker-compose.yml) (and live in the Admin Panel for already-running instances):
+
+| Setting | Value | Why |
+|---|---|---|
+| `WEB_SEARCH_RESULT_COUNT` | 10 | OW's 3-default is too tight — many pages don't yield usable text after extraction, so 10 keeps the rank step well-fed. |
+| `RAG_TOP_K` | 5 | More chunks reach the chat model's context → more inline citations possible. |
+| `WEB_SEARCH_DOMAIN_FILTER_LIST` | excludes `youtube.com`, `youtu.be`, `merriam-webster.com`, `dictionary.com`, `quora.com` | These rank well but yield empty/noisy text for chat grounding — skipping them frees fetch slots for real articles. |
+| `WEB_LOADER_ENGINE` | `playwright` | Handles cookie walls + JS-rendered pages. |
+| `ENABLE_SEARCH_QUERY_GENERATION` | `true` | LLM rephrases the user prompt into focused sub-queries (e.g. *"main news today"* → *"top global news headlines 2026-05-30"*). |
+
+Latency budget: ~3–10 s for search + Playwright fetch + embed; the rest is the chat model's own generation time. Works with any model in the dropdown but **not** with the PDF-RAG collection models (`ieee`, `amd`, `rag-active`) — those route through the rag-server and have their own RAG pipeline. To make web grounding default-on for a specific model, create a per-model preset under **Workspace → Models** with Web Search enabled in its capabilities.
+
+**Getting longer / more expansive replies:** small chat models (e.g. `gemma4:e4b`) default to terse, single-paragraph summaries even with rich context. Three levers:
+
+1. **Use a custom system prompt** — Admin Panel → Settings → Models → pick the model → **System Prompt** field. Something like: *"When answering with web-search context, write a multi-paragraph, multi-topic summary. Group related items under headings (Politics, Economy, Science, …). For each topic, name the source and a specific concrete detail. Always cite every source you use."*
+2. **Switch to a more verbose model** — `llama3.1:8b-instruct-q8_0` is chattier than `gemma4:e4b`; `nemotron-3-nano:30b-a3b-q4_K_M` (deep profile) synthesises more thoroughly but takes 2-3 min.
+3. **Ask specific queries instead of broad ones** — *"latest on UK general election"* returns article-level pages with body content; *"today's news"* returns section-index pages that are mostly nav + headlines, which gives the model thin material to expand on.
 
 Privacy note: queries (not chat content) egress to the external search engines that SearXNG aggregates. The LLM, embeddings, page fetcher, and ranker all run locally.
 

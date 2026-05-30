@@ -181,8 +181,23 @@ services:
       - ENABLE_WEB_SEARCH=true
       - WEB_SEARCH_ENGINE=searxng
       - SEARXNG_QUERY_URL=http://127.0.0.1:8888/search?q=<query>
-      - WEB_SEARCH_RESULT_COUNT=5
+      # Fetch budget per chat: top 10 SearXNG results → Playwright fetch.
+      # Bumped from the OW default of 3 because the funnel narrows hard
+      # (some fetched pages yield no usable text; Playwright drops cookie
+      # walls that resist; YouTube/dictionary entries waste slots). 10
+      # gives the rank step enough material to surface 4-6 cited sources.
+      - WEB_SEARCH_RESULT_COUNT=10
       - WEB_SEARCH_CONCURRENT_REQUESTS=10
+      # Drop sites that survive search ranking but consistently yield no
+      # article-body text (video pages, dictionary entries, Q&A scraping
+      # blocks). JSON array — OW parses it via json.loads(). The `!`
+      # prefix is OW's exclude marker.
+      - 'WEB_SEARCH_DOMAIN_FILTER_LIST=["!youtube.com","!youtu.be","!merriam-webster.com","!dictionary.com","!quora.com"]'
+      # Top-K chunks (across PDF-RAG AND web-search retrieval) that reach
+      # the chat model's context. Bumped from OW's default of 3 to widen
+      # the inline-citation pool — at 3, the model often cites just one
+      # source even with multiple pages fetched.
+      - RAG_TOP_K=5
       - ENABLE_SEARCH_QUERY_GENERATION=true
       # Playwright loader handles cookie-consent walls (Guardian, BBC,
       # most EU/UK news) + JS-rendered SPAs that the default requests-

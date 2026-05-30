@@ -1,0 +1,39 @@
+# Linux kernel networking: full stack (sockets, TCP/UDP/IP, netfilter,
+# bridging, packet schedulers, AF_PACKET, eBPF networking, etc.) + the
+# shared headers. Sparse-checkout of Linus's tree pinned at 6.12 LTS.
+#
+# Excludes drivers/net/ — that belongs in a future linux-drivers-net
+# collection if/when vendor driver questions become a workflow.
+
+url: https://github.com/torvalds/linux.git
+ref: v6.12
+
+sparse_paths:
+  - net/
+  # Shared headers consumers reach for.
+  - include/linux/skbuff.h
+  - include/linux/netdevice.h
+  - include/linux/netfilter.h
+  - include/linux/netfilter/
+  - include/linux/netlink.h
+  - include/linux/net.h
+  - include/linux/inet.h
+  - include/linux/in.h
+  - include/linux/in6.h
+  - include/linux/socket.h
+  - include/linux/tcp.h
+  - include/linux/udp.h
+  - include/linux/ip.h
+  - include/linux/ipv6.h
+  - include/linux/icmp.h
+  - include/linux/icmpv6.h
+  - include/linux/if_*.h
+  - include/linux/etherdevice.h
+  - include/net/
+  - include/uapi/linux/in.h
+  - include/uapi/linux/in6.h
+  - include/uapi/linux/socket.h
+  - include/uapi/linux/tcp.h
+  - include/uapi/linux/udp.h
+  - include/uapi/linux/netlink.h
+  - include/uapi/linux/netfilter/

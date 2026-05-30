@@ -1,0 +1,17 @@
+# Linux kernel USB subsystem: USB core, host controllers (xhci, ehci,
+# ohci, dwc3, …), gadget framework, function/class drivers, and the
+# shared headers. Sparse-checkout of Linus's tree pinned at 6.12 LTS.
+
+url: https://github.com/torvalds/linux.git
+ref: v6.12
+
+sparse_paths:
+  - drivers/usb/
+  - include/linux/usb.h
+  - include/linux/usb/
+  - include/linux/usbdevice_fs.h
+  - include/linux/usb_usual.h
+  - include/uapi/linux/usb/
+  - include/uapi/linux/usbdevice_fs.h
+  - Documentation/usb/
+  - Documentation/driver-api/usb/

@@ -1,0 +1,29 @@
+# Linux kernel filesystems: VFS layer + every in-tree filesystem
+# (ext4, btrfs, xfs, f2fs, overlayfs, fuse, nfs, ceph, …) + shared headers.
+# Sparse-checkout of Linus's tree pinned at 6.12 LTS.
+
+url: https://github.com/torvalds/linux.git
+ref: v6.12
+
+sparse_paths:
+  - fs/
+  # Shared headers consumers reach for.
+  - include/linux/fs.h
+  - include/linux/fs_context.h
+  - include/linux/fs_parser.h
+  - include/linux/fs_struct.h
+  - include/linux/dcache.h
+  - include/linux/dirent.h
+  - include/linux/file.h
+  - include/linux/path.h
+  - include/linux/namei.h
+  - include/linux/mount.h
+  - include/linux/buffer_head.h
+  - include/linux/iomap.h
+  - include/linux/quota.h
+  - include/linux/posix_acl.h
+  - include/linux/xattr.h
+  - include/linux/pagemap.h
+  - include/uapi/linux/fs.h
+  - include/uapi/linux/stat.h
+  - include/uapi/linux/magic.h

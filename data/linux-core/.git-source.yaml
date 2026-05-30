@@ -1,0 +1,27 @@
+# Linux kernel core: scheduler, syscalls, init, fundamental kernel APIs +
+# the headers everyone references. Sparse-checkout of Linus's tree pinned
+# at the 6.12 LTS tag for reproducible citations.
+#
+# Sibling collections (mm/fs/net subsystems) live in data/linux-{mm,fs,net}/.
+# Each shallow-clones the kernel into its own storage/code-cache/linux-<sub>/.
+# Disk cost: ~300 MB of git metadata per collection. The actual checkout
+# is only the sparse subtree.
+
+url: https://github.com/torvalds/linux.git
+ref: v6.12
+
+sparse_paths:
+  - kernel/
+  - init/
+  - include/linux/
+  - include/uapi/linux/
+  - Kconfig
+  - Makefile
+  - MAINTAINERS
+
+# Defaults in extract-code.py already cover *.c/*.h/Makefile/Kconfig/*.rst.
+# Override here if you want to slim further; e.g. drop *.rst.
+#
+# exclude_globs:
+#   - "**/*.dts"
+#   - "**/*.dtsi"

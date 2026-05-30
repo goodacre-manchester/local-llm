@@ -1,0 +1,30 @@
+# Linux kernel PCI subsystem: PCI/PCIe core, MSI/MSI-X, hotplug, IOV,
+# host controllers, and the shared headers. Sparse-checkout of Linus's
+# tree pinned at 6.12 LTS.
+#
+# Vendor PCI device drivers in drivers/net/, drivers/block/, etc. live
+# in their own (future) collections — this is the PCI subsystem itself,
+# not every device that happens to be PCI.
+
+url: https://github.com/torvalds/linux.git
+ref: v6.12
+
+sparse_paths:
+  - drivers/pci/
+  - include/linux/pci.h
+  - include/linux/pci-acpi.h
+  - include/linux/pci-aspm.h
+  - include/linux/pci-ats.h
+  - include/linux/pci-dma-compat.h
+  - include/linux/pci-doe.h
+  - include/linux/pci-ecam.h
+  - include/linux/pci-ep-cfs.h
+  - include/linux/pci-epc.h
+  - include/linux/pci-epf.h
+  - include/linux/pci_hotplug.h
+  - include/linux/pci_ids.h
+  - include/linux/pci_p2pdma.h
+  - include/linux/pcieport_if.h
+  - include/uapi/linux/pci.h
+  - include/uapi/linux/pci_regs.h
+  - Documentation/PCI/

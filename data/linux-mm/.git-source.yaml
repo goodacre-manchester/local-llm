@@ -1,0 +1,30 @@
+# Linux kernel memory management: page allocator, slab, virtual memory,
+# OOM killer, NUMA, transparent huge pages, etc. Sparse-checkout of
+# Linus's tree pinned at 6.12 LTS.
+
+url: https://github.com/torvalds/linux.git
+ref: v6.12
+
+sparse_paths:
+  - mm/
+  # Headers a mm/ consumer typically reaches into.
+  - include/linux/mm.h
+  - include/linux/mm_types.h
+  - include/linux/mmzone.h
+  - include/linux/page-flags.h
+  - include/linux/page_owner.h
+  - include/linux/pagemap.h
+  - include/linux/pageblock-flags.h
+  - include/linux/slab.h
+  - include/linux/slab_def.h
+  - include/linux/vmalloc.h
+  - include/linux/vmstat.h
+  - include/linux/swap.h
+  - include/linux/gfp.h
+  - include/linux/memcontrol.h
+  - include/linux/memory_hotplug.h
+  - include/linux/highmem.h
+  - include/linux/numa.h
+  - include/linux/oom.h
+  - include/linux/shmem_fs.h
+  - include/uapi/linux/mempolicy.h

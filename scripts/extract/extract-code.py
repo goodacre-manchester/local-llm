@@ -166,12 +166,18 @@ def _clone_or_pull(url: str, dest: Path, ref: str | None,
         if ref:
             clone_args += ["--branch", ref]
         if sparse_paths:
+            # --sparse starts with an empty cone (no files checked out)
+            # so we can switch to non-cone mode + set patterns before any
+            # blob fetches happen. Non-cone is required because
+            # sparse_paths often mixes directories + individual file
+            # paths + globs, all of which --cone rejects.
             clone_args += ["--sparse"]
         clone_args += [url, str(dest)]
         print(f"  git clone {url} (ref={ref or 'default HEAD'})", flush=True)
         _git(clone_args)
         if sparse_paths:
-            _git(["sparse-checkout", "set", "--cone"] + sparse_paths, cwd=dest)
+            _git(["config", "core.sparseCheckoutCone", "false"], cwd=dest)
+            _git(["sparse-checkout", "set"] + sparse_paths, cwd=dest)
     else:
         print("  git fetch + reset (existing clone)", flush=True)
         fetch_ref = ref if ref else "HEAD"

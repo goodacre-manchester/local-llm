@@ -32,6 +32,21 @@ Phase F/H VLM captioning does not fix this. The contrastive-recall failure is ab
 
 Re-ask the question with the defining clause number explicit (*"summarise Clause 12.29 — the Gate Parameter Table"*).
 
+## Pending tasks (next session)
+
+- **Investigate second 5070 Ti impact** (if installed). With 32 GB total VRAM the deep model fits fully and the per-workflow GPU contention disappears. Expected measurements to capture as a baseline vs single-card:
+  - `!deep` profile latency on a known prompt — expected ~2–3 min → ~30–60 s as `nemotron-3-nano:30b-a3b-q4_K_M` (~24 GB) stops spilling ~8 GB to system RAM.
+  - VLM captioning rate — expected ~30–45 s/pic → ~15–25 s/pic, and no longer requires `docker compose stop sd-webui` first.
+  - Concurrent SDXL image-gen + chat — expected to work without OOM (currently OOMs on `!deep` + SDXL together).
+  - Web-search Task-Model rephrasing latency — expected 5–15 s → ~0–5 s if the Task Model stays resident on the second card.
+  - Run `nvidia-smi` to confirm both cards visible; `ollama ps` to see per-model GPU placement. If sd-webui keeps grabbing the same card as the chat model, pin it via `CUDA_VISIBLE_DEVICES=1` in its compose env.
+- **Process `data/seccom/` corpus.** Listed in `/v1/models` as `seccom` / `seccom!deep` but source PDFs need extract → caption → ingest:
+  - Inspect `data/seccom/` (PDF count, document type) to pick the extractor — PyMuPDF4LLM for datasheets / RFCs, Nemotron Parse for layout-heavy standards.
+  - Run `scripts/extract-pdfs.ps1 seccom` or `scripts/extract-nemo.ps1 seccom`.
+  - Run `scripts/extract/run-caption-pipeline.sh` against the corpus to caption pictures.
+  - Force re-ingest: `POST /collections/seccom/ingest {"force":true}`.
+  - Confirm the `seccom` model in Open WebUI returns grounded answers with citations.
+
 ## Open polish items (low priority, none blocking)
 
 - **Persistent empty captions** in a small number of dense state-diagram figures in `802-3-2022`. `qwen3-vl:8b` reliably emits empty completions on these. A different VLM (larger context or different sampling) is the lever; another retry pass has diminishing returns.

@@ -215,9 +215,9 @@ Promote `CHAT_MODEL_DEEP=nemotron-3-nano:30b-a3b-q4_K_M` in
 | `scripts/extract/extract-nemo.py` + `extract-nemo.ps1` + `.venv-nemo/` | Parse extraction tooling | **YES** — promoted-to-default path needs this. |
 | `scripts/nemo-rag/server.py` | embed + rerank HF sidecar | **YES** — quiet on disk; re-bench gate for future Nemotron releases. |
 | `storage/nemo-parse/hf-cache/` | HF model cache (Parse + embed + rerank) | **YES** — ~10 GB, but re-downloading is annoying. |
-| `data/ieee-nemo-parse-tas/` | Phase 3a slice (39 pages of 8021Q-2022) | **YES** — eval reproducibility. |
-| `data/ieee-nemo-rag-tas/` | Phase 4 (Nemotron embed) | YES temporarily; can delete after Phase 5 commit. |
-| `data/ieee-nemo-rerank-tas/` | Phase 4b (nomic embed + Nemotron rerank) | YES temporarily; can delete after Phase 5 commit. |
+| `data/ieee-nemo-parse-tas/` | Phase 3a slice (39 pages of 8021Q-2022) | **REMOVED 2026-05-30.** Eval is concluded (Parse is the production extractor for the IEEE corpus). The slice regenerates in ~7 min if needed: `$env:NEMO_PARSE_PAGES = "203-238,480-482"; .\scripts\extract-nemo.ps1 <name>`. |
+| `data/ieee-nemo-rag-tas/` | Phase 4 (Nemotron embed) | **REMOVED** post Phase 5. |
+| `data/ieee-nemo-rerank-tas/` | Phase 4b (nomic embed + Nemotron rerank) | **REMOVED** post Phase 5. |
 | `nemo-parse` compose service (stopped) | Original vLLM-served Parse attempt | YES — flagged as deprecated in compose comments; revival gate documented. |
 | `docker-compose.yml`: `NEMO_RAG_URL` + `NEMO_EMBED_COLLECTIONS` + `NEMO_RERANK_COLLECTIONS` env vars | Per-feature routing | **YES** — inert when sidecar not running; documents how to opt collections in. |
 
@@ -245,9 +245,12 @@ If revisiting after a Nemotron model-family update or a hardware bump:
      export HF_HOME=/mnt/d/Projects/local-llm/storage/nemo-parse/hf-cache && \
      python /mnt/d/Projects/local-llm/scripts/nemo-rag/server.py"`
 2. `docker compose up -d rag-server` to recreate (env vars already wired).
-3. `.\scripts\benchmark\run.ps1` + `score.ps1` against the four eval
-   collections (`ieee-nemo-parse-tas`, `ieee-nemo-rag-tas`,
-   `ieee-nemo-rerank-tas`, baseline `ieee`).
+3. The original eval used four collections (`ieee-nemo-parse-tas`,
+   `ieee-nemo-rag-tas`, `ieee-nemo-rerank-tas`, baseline `ieee`). All
+   three eval slices have been removed from disk + Chroma. Re-create
+   on demand: extract the 39-page slice via `NEMO_PARSE_PAGES` env to
+   a fresh collection (e.g. `data/ieee-eval-slice/`), then bench with
+   `-CollectionOverride "ieee-eval-slice"`.
 
 Plan file: `~/.claude/plans/concurrent-scribbling-cocke.md`. Per-session
 narrative: `NEXT-STEPS-NEMOTRON-EVAL.md` (updated alongside this report).

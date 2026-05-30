@@ -14,8 +14,13 @@
 #
 # Usage:
 #   .\scripts\extract-nemo.ps1                       # all collections
-#   .\scripts\extract-nemo.ps1 ieee-nemo-parse-tas   # one collection
-#   .\scripts\extract-nemo.ps1 ieee-nemo-parse-tas -Force
+#   .\scripts\extract-nemo.ps1 ieee                  # one collection
+#   .\scripts\extract-nemo.ps1 ieee -Force
+#
+# Slice extraction (e.g. just §8.6 + §12.29 of one PDF, ~7 min):
+#   $env:NEMO_PARSE_PAGES = "203-238,480-482"
+#   .\scripts\extract-nemo.ps1 <some-collection>
+#   Remove-Item Env:NEMO_PARSE_PAGES
 
 param(
     [string]$Collection = "",

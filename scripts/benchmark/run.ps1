@@ -5,7 +5,7 @@
 # Usage:
 #   .\scripts\benchmark\run.ps1 -RunId baseline-20260522-1830
 #   .\scripts\benchmark\run.ps1 -RunId p2-nemo-gen-20260522 -ProfileOverride "nemotron-3-nano:30b-a3b-q4_K_M"
-#   .\scripts\benchmark\run.ps1 -RunId p3a-nemo-parse-20260522 -CollectionOverride "ieee-nemo-parse-tas"
+#   .\scripts\benchmark\run.ps1 -RunId p3a-nemo-parse-20260522 -CollectionOverride "ieee-eval-slice"
 #
 # The HTTP call goes via `wsl bash curl` rather than Invoke-WebRequest because
 # the rag-server runs in WSL on `network_mode: host` and isn't always reachable
@@ -14,7 +14,7 @@
 #
 # Overrides apply uniformly across all prompts whose collection matches the
 # original collection (so an `amd`-collection prompt isn't rerouted to an
-# `ieee-nemo-parse-tas` variant). To override only a subset, edit prompts.json.
+# `ieee`-eval-slice variant). To override only a subset, edit prompts.json.
 
 [CmdletBinding()]
 param(
@@ -25,7 +25,7 @@ param(
     [string]$CollectionOverride = "",
     [string]$ProfileOverride    = "",
     # Override only prompts whose default collection matches this (e.g. "ieee").
-    # Useful when comparing ieee->ieee-nemo-parse-tas without also rerouting amd.
+    # Useful when comparing ieee->ieee-eval-slice without also rerouting amd.
     [string]$OverrideOnlyCollection = "",
     [int]$TimeoutSec            = 700,
     [string]$ApiKey             = ""

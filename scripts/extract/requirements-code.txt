@@ -1,0 +1,7 @@
+# Code-tree extractor (scripts/extract/extract-code.py) deps.
+# CPU-only; small footprint (~50 MB). Installs into the shared
+# scripts/extract/.venv alongside PyMuPDF4LLM.
+
+tree_sitter>=0.23
+tree_sitter_language_pack>=0.4
+PyYAML>=6

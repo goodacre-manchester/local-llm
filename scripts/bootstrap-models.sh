@@ -26,6 +26,13 @@ ollama pull qwen3.6:35b-a3b
 # spillover on 16GB cards. Designed for grounded retrieval / agentic reasoning.
 ollama pull nemotron-3-nano:30b-a3b-q4_K_M
 ollama pull nomic-embed-text
+# Qwen3 Embedding 0.6B (~640MB): small + fast code-aware embedder used by
+# the source-tree RAG path (extract-code.py). Co-resides comfortably with
+# the chat models on a 16 GB GPU. Swap to qwen3-embedding:4b or :8b for
+# better recall on nuanced architectural questions once GPU headroom
+# allows (env var EMBEDDING_MODEL_CODE on rag-server controls which is
+# used). Per-collection routing via EMBED_CODE_COLLECTIONS env.
+ollama pull qwen3-embedding:0.6b
 
 echo "Installed models:"
 ollama list

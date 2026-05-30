@@ -65,10 +65,12 @@ The final command confirms the NVIDIA Container Toolkit is wired into the Docker
 │   ├── open-webui-entrypoint.sh    # surgical upstream-bug patch for Web Search
 │   ├── extract-pdfs.ps1            # entry for PyMuPDF4LLM extractor
 │   ├── extract-nemo.ps1            # entry for Nemotron Parse extractor
+│   ├── extract-code.ps1            # entry for source-tree extractor
 │   ├── dump-sidecar-md.ps1         # renders human-readable .md views of sidecars
 │   ├── extract/
 │   │   ├── extract.py              # PyMuPDF4LLM-backed extractor
 │   │   ├── extract-nemo.py         # NVIDIA Nemotron Parse v1.2 extractor
+│   │   ├── extract-code.py         # source-tree extractor (tree-sitter, git link/in-place)
 │   │   ├── caption-images.py       # VLM captioner (qwen3-vl:8b, v3-ctx prompt)
 │   │   ├── run-caption-pipeline.sh # unified caption pipeline
 │   │   ├── rerender-pictures.py    # re-render PNGs from stored bboxes
@@ -100,7 +102,8 @@ The final command confirms the NVIDIA Container Toolkit is wired into the Docker
 │   ├── reranker/                   # reranker venv + HF model cache
 │   ├── sd-webui/                   # A1111 workspace + SDXL checkpoints + pip cache
 │   ├── nemo-parse/                 # Parse HF cache + caption pipeline logs
-│   └── open-webui-playwright/      # persisted Chromium for Playwright web loader
+│   ├── open-webui-playwright/      # persisted Chromium for Playwright web loader
+│   └── code-cache/                 # cloned repos for "link-mode" code collections
 ├── docs/archive/                   # historical hand-off docs (reference only)
 ├── design.md                       # this file
 ├── README.md                       # project description + capabilities + usage
@@ -342,7 +345,8 @@ Required for the RAG path:
 
 - `gemma4:e4b` — fast generation profile.
 - `nemotron-3-nano:30b-a3b-q4_K_M` — deep generation profile.
-- `nomic-embed-text` — embedding model.
+- `nomic-embed-text` — embedding model (PDF + general).
+- `qwen3-embedding:0.6b` — code-aware embedder for source-tree RAG collections (per-collection routing via `EMBED_CODE_COLLECTIONS`).
 - `qwen3-vl:8b` — VLM for figure captioning.
 
 The script also pulls optional models for direct chat (`llama3.1:8b-instruct-q8_0`, `deepseek-r1:14b`, `gemma4:26b`, `qwen3.6:27b`, `qwen3.6:35b-a3b`). Edit it before running if you only want the required set (the optional library is ~95 GB).
@@ -460,6 +464,48 @@ wsl -e bash -lc "cd /mnt/d/Projects/local-llm && sudo docker compose up -d rag-s
 | `invalidate-captions.py <data_dir> [collection] [--only-prompt PID] [--dry]` | Clear VLM fields so the next captioner run regenerates them. |
 | `caption-images.py <data_dir> <collection> [--force] [--restrip-only] [--sample N]` | Re-run captioning with various scopes. |
 | `dump-sidecar-md.py <data_dir> <collection> [--force]` | Re-render `.rag-md/` previews. |
+
+## 7a. Adding a source tree to a collection
+
+Source-tree (code) collections use the same `data/<name>/` convention plus a different extractor backend (`scripts/extract/extract-code.py`). Two modes:
+
+- **Link mode**: `data/<name>/.git-source.yaml` exists. The extractor shallow-clones the remote repo into `storage/code-cache/<name>/` (gitignored) at the configured ref/sparse-paths, then walks that clone. Each chunk's `github_url` is built from the resolved commit SHA so citations are stable. Updates: re-run the extractor — does `git fetch` + `reset --hard FETCH_HEAD`.
+- **In-place mode**: no yaml; the extractor walks `data/<name>/` directly (skipping `.git/`, `.rag-cache/`, `.rag-images/`, dotfiles). Used for small repos or vendored snapshots.
+
+`.git-source.yaml` shape:
+
+```yaml
+url: https://github.com/<owner>/<repo>.git
+ref: <branch | tag | commit-SHA>     # optional; default = remote HEAD
+sparse_paths:                         # optional; sparse-checkout to these subtrees
+  - src/
+include_globs:                        # optional; defaults cover common source files
+  - "*.c"
+exclude_globs:                        # optional; merged with built-in defaults
+  - "**/contrib/**"
+```
+
+Per file the extractor:
+
+1. Filters by include/exclude globs and skips binary files + files >1 MB (`EXTRACT_CODE_MAX_FILE_KB`).
+2. For supported languages (`.c .h .cpp .hpp .py .go .rs .js .ts .java .rb`), chunks via `tree_sitter` at function/class/struct boundaries.
+3. For unsupported languages and markdown/configs, falls back to line-window chunks (50 lines / 10-line overlap, char-capped at `CHUNK_MAX_CHARS=800` so rag-server's whitespace-collapse never fires).
+4. Writes one sidecar per source file at `data/<name>/.rag-cache/<encoded-path>.json` with `backend="code-tree-sitter"`. Block fields: `text` (preserving whitespace), `type:"code"`, `section` (`<file path>::<function-or-chunk-id>`), `file_path`, `line_start`, `line_end`, `language`, `github_url` (link mode only).
+
+Workflow:
+
+```powershell
+.\scripts\extract-code.ps1 nginx
+# add the collection name to EMBED_CODE_COLLECTIONS in docker-compose.yml
+wsl -e bash -lc "cd /mnt/d/Projects/local-llm && sudo docker compose up -d rag-server"
+wsl -e bash -lc "curl -fsS -X POST -H 'Content-Type: application/json' -d '{\"force\":true}' http://127.0.0.1:3000/collections/nginx/ingest"
+```
+
+The rag-server treats `type:"code"` as plain text for chunking but the `file_path` / `line_start` / `github_url` metadata propagates to Chroma and surfaces in citations. **Per-collection embedder routing**: collections listed in `EMBED_CODE_COLLECTIONS` use `EMBEDDING_MODEL_CODE` (default `qwen3-embedding:0.6b`) instead of `EMBEDDING_MODEL` (`nomic-embed-text`). The choice is per-collection on a single rag-server.
+
+For larger embedding quality at the cost of latency, swap `EMBEDDING_MODEL_CODE` to `qwen3-embedding:4b` or `:8b` and recreate rag-server. Re-ingest required (different embedding dimensions).
+
+**Scale note**: nginx (~250k LoC, 395 source files after sparse-checkout) yields ~9k chunks and embeds in ~25-30 min on `qwen3-embedding:0.6b` with the embedder co-resident with a chat model. Larger repos should be scoped per-subtree as separate collections rather than one mega-collection to keep ingest tractable and retrieval focused.
 
 ## 8. Open WebUI Setup
 
@@ -623,6 +669,7 @@ Keep these invariant unless intentionally changed:
 7. The `open-webui-entrypoint.sh` host-mount + entrypoint wiring (Web Search bug patch — see service spec in §4).
 8. Pre-pointed Open WebUI image-gen + Web Search env vars in compose (`ENABLE_IMAGE_GENERATION`, `AUTOMATIC1111_BASE_URL`, `ENABLE_WEB_SEARCH`, `WEB_SEARCH_ENGINE`, `SEARXNG_QUERY_URL`, `WEB_LOADER_ENGINE`, …).
 9. Curated `searxng/settings.yml` engine list (committed; the matching `SEARXNG_SECRET` is in `.env`, gitignored).
+10. Code-RAG env wiring on rag-server: `EMBEDDING_MODEL_CODE=qwen3-embedding:0.6b` and `EMBED_CODE_COLLECTIONS=<comma-separated>` list of collections that route through the code embedder. Source trees live under `data/<name>/` with either `.git-source.yaml` (link mode → cloned to `storage/code-cache/<name>/`) or as a direct in-place clone.
 
 All PowerShell scripts derive the repo path from `$PSScriptRoot` — no hardcoded paths. The repo is relocatable across drives or directories.
 

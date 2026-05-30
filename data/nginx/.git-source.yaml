@@ -1,0 +1,38 @@
+# Source-tree RAG: link mode for nginx upstream.
+# extract-code.py reads this, shallow-clones the repo into
+# ../../storage/code-cache/nginx/ at the configured ref, then walks
+# that and writes per-file sidecars into ./.rag-cache/.
+#
+# Updates: re-run `.\scripts\extract-code.ps1 nginx` — does git fetch +
+# reset --hard FETCH_HEAD against the configured ref, then mtime-skips
+# unchanged files.
+
+url: https://github.com/nginx/nginx.git
+ref: release-1.27.0
+
+# Sparse-checkout: skip auto-generated, contrib, and CI bits — the
+# substantive source lives under src/, with auto/ + docs/ giving the
+# build system + reference docs for "how is X configured" questions.
+sparse_paths:
+  - src/
+  - auto/
+  - conf/
+  - docs/
+  - contrib/vim/
+  - README
+
+# Include / exclude globs are optional — the defaults in extract-code.py
+# already cover .c/.h/.md/.yaml/etc. Uncomment to override per repo.
+#
+# include_globs:
+#   - "*.c"
+#   - "*.h"
+#   - "*.md"
+#   - "auto/*"
+#
+# exclude_globs:
+#   - "**/contrib/**"
+
+# Optional: pin the github_url base. Default is auto-derived from `url`
+# with the resolved commit SHA so citations stay stable across re-runs.
+# github_blob_base_url: https://github.com/nginx/nginx/blob/release-1.27.0

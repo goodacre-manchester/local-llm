@@ -14,8 +14,15 @@ node_modules/
 *.pyc
 
 # RAG corpus + derived state (PDFs are copyright-restricted; DB is local state)
-data/*/
+# Ignore the CONTENTS of each collection (PDFs, source, .rag-cache,
+# .rag-images, .rag-md) but keep the folders themselves so collection
+# placeholders + the seed configs below can be tracked.
+data/*/*
 !data/*/.gitkeep
+# Source-tree RAG seed configs ARE committed (they describe the remote +
+# ref + sparse-paths for a code collection; the clone itself is gitignored
+# under storage/code-cache/).
+!data/*/.git-source.yaml
 storage/
 
 # Benchmark run outputs (the scripts + prompts.json are committed; results aren't)
@@ -25,6 +32,10 @@ scripts/benchmark/results/
 searxng/secret_key
 searxng/uwsgi.ini
 searxng/state/
+
+# Source-tree RAG: cloned repos for "link-mode" code collections live here
+# (machine-local; reproducible from data/<name>/.git-source.yaml configs)
+storage/code-cache/
 
 # Editor / OS
 .vscode/*

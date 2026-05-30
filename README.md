@@ -10,6 +10,7 @@ The stack is **local-only for inference**: no cloud LLM calls, no telemetry. The
 |---|---|
 | **Chat** | Browser UI (Open WebUI) talking to local Ollama models. |
 | **PDF RAG** | One folder per document collection, OpenAI-compatible chat endpoint per collection. Cited answers with file + page + clause references. |
+| **Source-tree RAG** | Drop a `.git-source.yaml` (or clone) under `data/<repo>/` to RAG-index a source tree. Answers cite `file:line` ranges with deep-linked GitHub URLs in chunk metadata. Code-aware tree-sitter chunking + a dedicated code embedder (`qwen3-embedding:0.6b`). |
 | **Two generation profiles** | Per-request switch between fast (`gemma4:e4b`, ~50 s) and deep (`nemotron-3-nano:30b-a3b-q4_K_M`, ~2–3 min) by appending `!deep` to the collection name. |
 | **Layout-aware extraction** | Two extractor backends: PyMuPDF4LLM (CPU, fast) for datasheets; NVIDIA Nemotron Parse v1.2 (GPU) for layout-heavy standards. |
 | **Picture grounding** | Every figure in every PDF is extracted as a PNG and captioned by a vision-language model (`qwen3-vl:8b`). The captions become searchable chunk text, so questions about diagrams hit the right figure. |
@@ -139,6 +140,42 @@ wsl -e bash -lc "curl -fsS -X POST http://127.0.0.1:3000/collections/<collection
 # 4. (For a NEW collection) recreate rag-server so it appears in the model selector
 wsl -e bash -lc "cd /mnt/d/Projects/local-llm && sudo docker compose up -d rag-server --force-recreate"
 ```
+
+### Adding a source tree to a collection
+
+Source-tree collections use the same `data/<name>/` convention, plus a new extractor. Two modes:
+
+**Link mode** (recommended for large upstream repos): create `data/<name>/.git-source.yaml` pointing at a remote — the extractor shallow-clones into `storage/code-cache/<name>/` (gitignored) and walks that. Example for nginx:
+
+```yaml
+# data/nginx/.git-source.yaml
+url: https://github.com/nginx/nginx.git
+ref: release-1.27.0
+sparse_paths:
+  - src/
+  - auto/
+  - docs/
+```
+
+**In-place mode**: drop source files (or `git clone` into the folder directly). The extractor detects this when there's no `.git-source.yaml` and at least one source file extension present. Use this for small repos or vendored snapshots.
+
+Run the extractor:
+
+```powershell
+.\scripts\extract-code.ps1 <name>           # one collection
+.\scripts\extract-code.ps1 <name> -Force    # re-extract every file
+```
+
+The extractor walks the tree, chunks each source file via `tree-sitter` (function/class boundaries for `.c/.cpp/.py/.go/.rs/.js/.ts/.java/.rb`; line-window fallback for everything else), and writes one sidecar per file into `data/<name>/.rag-cache/`. Each chunk carries `file_path`, `line_start`, `line_end`, `language`, and (for link-mode collections) a `github_url` resolved against the actual commit SHA.
+
+Add the new collection name to `EMBED_CODE_COLLECTIONS` in `docker-compose.yml`'s `rag-server` env so it uses `qwen3-embedding:0.6b` (code-aware) instead of `nomic-embed-text`. Then recreate rag-server and ingest:
+
+```powershell
+wsl -e bash -lc "cd /mnt/d/Projects/local-llm && sudo docker compose up -d rag-server"
+wsl -e bash -lc "curl -fsS -X POST -H 'Content-Type: application/json' -d '{\"force\":true}' http://127.0.0.1:3000/collections/<name>/ingest"
+```
+
+The collection appears in Open WebUI's model dropdown as `<name>` + `<name>!deep`. Updates: re-run `extract-code.ps1 <name>` — link mode does `git fetch` + `reset --hard FETCH_HEAD`; both modes mtime-skip unchanged files.
 
 If you add captions to a collection that's already been ingested, the PDF mtimes are unchanged — pass `{"force":true}` to the ingest call so it re-reads the sidecars.
 

@@ -26,6 +26,12 @@ const OLLAMA_HOST   = process.env.OLLAMA_HOST   || "http://127.0.0.1:11434";
 const CHROMA_URL    = process.env.CHROMA_URL    || "http://127.0.0.1:8000";
 const DATA_DIR      = process.env.DATA_DIR      || "/data";
 const EMBEDDING_MODEL = process.env.EMBEDDING_MODEL || "nomic-embed-text";
+// Per-collection code-tuned embedder. Used by collections listed in
+// EMBED_CODE_COLLECTIONS (comma-separated). Source-tree RAG collections
+// (extract-code.py output) benefit from a code-trained embedder; other
+// collections stay on EMBEDDING_MODEL unchanged. Same Nomic family so
+// the API shape + dim conventions match.
+const EMBEDDING_MODEL_CODE = process.env.EMBEDDING_MODEL_CODE || "nomic-embed-code";
 // Two generation profiles, selectable per request via the OpenAI `model`
 // field suffix `!deep` (e.g. "amd!deep"):
 //   CHAT_MODEL      – fast default (GPU-resident, snappy, honest).
@@ -60,8 +66,15 @@ const _parseList = (v) => new Set(String(v || "").split(",").map((s) => s.trim()
 const _legacyBoth = _parseList(process.env.NEMO_RAG_COLLECTIONS);
 const NEMO_EMBED_COLLECTIONS  = new Set([..._parseList(process.env.NEMO_EMBED_COLLECTIONS), ..._legacyBoth]);
 const NEMO_RERANK_COLLECTIONS = new Set([..._parseList(process.env.NEMO_RERANK_COLLECTIONS), ..._legacyBoth]);
+// Collections that should embed via the code-tuned model (same Ollama
+// endpoint, different model name). Decoupled from Nemo routing so they
+// can coexist (Nemo path wins if both lists include the same name).
+const EMBED_CODE_COLLECTIONS  = new Set(_parseList(process.env.EMBED_CODE_COLLECTIONS));
 function useNemoEmbed(collectionName) {
   return Boolean(NEMO_RAG_URL) && NEMO_EMBED_COLLECTIONS.has(String(collectionName || ""));
+}
+function useCodeEmbed(collectionName) {
+  return EMBED_CODE_COLLECTIONS.has(String(collectionName || ""));
 }
 function useNemoRerank(collectionName) {
   return Boolean(NEMO_RAG_URL) && NEMO_RERANK_COLLECTIONS.has(String(collectionName || ""));
@@ -213,10 +226,11 @@ async function embedTexts(inputs, kind = "document", collectionName = "") {
     );
   }
 
+  const ollamaEmbedModel = useCodeEmbed(collectionName) ? EMBEDDING_MODEL_CODE : EMBEDDING_MODEL;
   const response = await fetch(`${OLLAMA_HOST}/api/embed`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ model: EMBEDDING_MODEL, input: inputs, truncate: true })
+    body: JSON.stringify({ model: ollamaEmbedModel, input: inputs, truncate: true })
   });
 
   if (!response.ok) {
@@ -568,17 +582,51 @@ async function ingestCollection(name, { force = false } = {}) {
     .filter((e) => e.isFile() && e.name.toLowerCase().endsWith(".pdf"))
     .map((e) => e.name);
 
-  if (pdfs.length === 0) {
+  // Sidecar-only documents: .rag-cache/*.json files with no corresponding
+  // PDF in the folder. Code-RAG collections (extract-code.py output) work
+  // this way — each source file becomes a sidecar named after its path
+  // (e.g. src__core__ngx_regex.c.json). The sidecar's `doc` field is the
+  // repo-relative path; we use the bare sidecar stem as fileName.
+  let sidecarOnly = [];
+  try {
+    const cacheEntries = await fs.readdir(path.join(folderPath, ".rag-cache"), { withFileTypes: true });
+    const pdfSidecarNames = new Set(pdfs.map((p) => `${p}.json`));
+    sidecarOnly = cacheEntries
+      .filter((e) => e.isFile() && e.name.toLowerCase().endsWith(".json"))
+      .filter((e) => !pdfSidecarNames.has(e.name))
+      .map((e) => e.name.replace(/\.json$/i, ""));
+  } catch { /* no .rag-cache dir at all — fine for empty/new collections */ }
+
+  const allDocs = [
+    ...pdfs.map((fileName) => ({ fileName, mode: "pdf" })),
+    ...sidecarOnly.map((fileName) => ({ fileName, mode: "sidecar" })),
+  ];
+
+  if (allDocs.length === 0) {
     return { collection: name, files: 0, totalChunks: 0, results: [] };
   }
 
   const colId = await ensureCollection(name);
   const results = [];
 
-  for (const fileName of pdfs) {
-    const fullPath = path.join(folderPath, fileName);
-    const stat = await fs.stat(fullPath);
-    const mtime = stat.mtime.toISOString();
+  for (const { fileName, mode } of allDocs) {
+    let mtime;
+    let fullPath = null;
+    let preloadedSidecar = null;
+    if (mode === "pdf") {
+      fullPath = path.join(folderPath, fileName);
+      const stat = await fs.stat(fullPath);
+      mtime = stat.mtime.toISOString();
+    } else {
+      // Sidecar-only path: load once + use its source_mtime for the skip check.
+      preloadedSidecar = await loadSidecar(folderPath, fileName);
+      if (!preloadedSidecar) {
+        console.warn(`[ingest] ${name}/${fileName}: sidecar unreadable — skipping`);
+        results.push({ fileName, chunkCount: 0, failed: true });
+        continue;
+      }
+      mtime = preloadedSidecar.source_mtime || new Date().toISOString();
+    }
 
     if (!force && await isFileIngested(colId, fileName, mtime)) {
       pushEvent("ingest.progress", { state: "skipped", fileName, collection: name });
@@ -604,18 +652,22 @@ async function ingestCollection(name, { force = false } = {}) {
       } catch { /* ignore — collection may be empty */ }
 
       // Prefer the structure-aware sidecar (tables/pages/sections preserved);
-      // fall back to flat pdf-parse text if the PDF hasn't been extracted yet.
-      const sidecar = await loadSidecar(folderPath, fileName);
+      // fall back to flat pdf-parse text if a PDF hasn't been extracted yet.
+      // Sidecar-only mode already loaded the sidecar above for mtime; reuse it.
+      const sidecar = preloadedSidecar || await loadSidecar(folderPath, fileName);
       let chunks, source;
       if (sidecar) {
         chunks = chunkBlocks(sidecar.blocks);
         source = `sidecar:${sidecar.backend || "?"}`;
-      } else {
+      } else if (mode === "pdf") {
         console.warn(`[ingest] ${name}/${fileName}: no usable sidecar — FLAT pdf-parse fallback (no pages/sections)`);
         const text = await readPdfText(fullPath);
         chunks = chunkText(text, CHUNK_SIZE, CHUNK_OVERLAP)
           .map((t) => ({ text: t, page: null, section: "", blockType: "text", embedInput: t }));
         source = "pdf-parse (no sidecar — run scripts/extract-pdfs.ps1 for citations)";
+      } else {
+        // Sidecar-only mode but sidecar gone between discovery + load — shouldn't happen.
+        throw new Error(`sidecar disappeared mid-ingest: ${fileName}`);
       }
 
       // Embed + upsert in batches: large datasheets produce tens of thousands
@@ -662,14 +714,16 @@ async function ingestCollection(name, { force = false } = {}) {
     }
   }
 
-  // Prune chunks for files that no longer exist (deleted/renamed PDFs).
-  // Per-file ingest only deletes-then-reinserts files that still exist, so a
-  // removed PDF would otherwise leave stale, page-less chunks polluting
-  // retrieval forever. $nin keeps only chunks whose fileName is a current PDF.
+  // Prune chunks for files that no longer exist (deleted/renamed PDFs or
+  // removed source files in code collections). Per-file ingest only
+  // deletes-then-reinserts files that still exist, so a removed file would
+  // otherwise leave stale chunks polluting retrieval forever. The valid
+  // set is the union of current PDFs + current sidecar-only filenames.
+  const validFileNames = allDocs.map((d) => d.fileName);
   try {
     await chromaRequest(`/api/v1/collections/${colId}/delete`, {
       method: "POST",
-      body: JSON.stringify({ where: { fileName: { $nin: pdfs } } }),
+      body: JSON.stringify({ where: { fileName: { $nin: validFileNames } } }),
     });
   } catch (e) {
     console.error(`[ingest] orphan prune failed for ${name}:`, e.message);
@@ -680,7 +734,7 @@ async function ingestCollection(name, { force = false } = {}) {
 
   return {
     collection: name,
-    files: pdfs.length,
+    files: allDocs.length,
     totalChunks: results.reduce((s, r) => s + r.chunkCount, 0),
     results
   };
@@ -1287,6 +1341,9 @@ app.listen(PORT, async () => {
   console.log(`Ollama         : ${OLLAMA_HOST}`);
   console.log(`Chroma         : ${CHROMA_URL}`);
   console.log(`Embedding model: ${EMBEDDING_MODEL}`);
+  if (EMBED_CODE_COLLECTIONS.size) {
+    console.log(`  code embed   : ${EMBEDDING_MODEL_CODE} for ${[...EMBED_CODE_COLLECTIONS].join(", ")}`);
+  }
   if (NEMO_RAG_URL && (NEMO_EMBED_COLLECTIONS.size || NEMO_RERANK_COLLECTIONS.size)) {
     console.log(`Nemo-RAG       : ${NEMO_RAG_URL}`);
     if (NEMO_EMBED_COLLECTIONS.size)  console.log(`  embed for    : ${[...NEMO_EMBED_COLLECTIONS].join(", ")}`);

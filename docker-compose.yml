@@ -35,6 +35,17 @@ services:
       - CHROMA_URL=http://127.0.0.1:8000
       - DATA_DIR=/data
       - EMBEDDING_MODEL=nomic-embed-text
+      # Per-collection code-aware embedder (Ollama). Used by source-tree
+      # RAG collections (extract-code.py output); other collections keep
+      # nomic-embed-text. Qwen3-Embedding 0.6B chosen for the first pass
+      # — small (~640MB) so it co-resides with the chat models on a
+      # 16 GB card, fast ingest (~5 min for nginx-sized repos), code-aware.
+      # Swap to qwen3-embedding:4b or :8b for better recall on nuanced
+      # architectural questions when GPU headroom allows.
+      - EMBEDDING_MODEL_CODE=qwen3-embedding:0.6b
+      # Comma-separated list of collections that route to EMBEDDING_MODEL_CODE
+      # instead of EMBEDDING_MODEL. Add new code collections here.
+      - EMBED_CODE_COLLECTIONS=nginx
       # Fast default + opt-in deep (request "<collection>!deep"). See §5.3.
       - CHAT_MODEL=gemma4:e4b
       # 2026-05-25: promoted from qwen2.5-coder:32b-instruct-q4_K_M per the

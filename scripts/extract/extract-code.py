@@ -265,51 +265,224 @@ def _get_ts_parser(language: str):
     return parser
 
 
-def _ts_node_name(node, source_bytes: bytes) -> str | None:
-    """Best-effort: find an identifier inside the node to label the chunk."""
-    for child in node.children:
-        if child.type == "identifier":
-            return source_bytes[child.start_byte:child.end_byte].decode(
-                "utf-8", errors="replace"
-            )
-        # Look one level deeper for declarator wrappers (C/C++).
-        for grand in child.children:
-            if grand.type == "identifier":
-                return source_bytes[grand.start_byte:grand.end_byte].decode(
-                    "utf-8", errors="replace"
-                )
+_IDENTIFIER_KINDS = (
+    "identifier", "type_identifier", "field_identifier",
+    "property_identifier", "scoped_identifier",
+)
+
+# Names that look like identifiers to tree-sitter but are actually kernel/glibc
+# attribute macros — surfacing one of these as a chunk title is useless. When
+# we hit one, keep searching for the real name.
+_USELESS_MACRO_NAMES = {
+    "__init", "__exit", "__weak", "__pure", "__cold", "__hot",
+    "__visible", "__user", "__kernel", "__rcu", "__force",
+    "__must_check", "__attribute__", "__attribute",
+    "__always_inline", "__inline", "__noinline", "__noreturn",
+    "__no_sanitize_address", "__no_kasan_or_inline", "__no_stack_protector",
+    "asmlinkage", "inline", "static", "extern", "const", "volatile",
+    "void", "int", "long", "short", "char", "float", "double",
+}
+
+
+def _ts_byte_text(node, source_bytes: bytes) -> str:
+    br = node.byte_range()
+    return source_bytes[br.start:br.end].decode("utf-8", errors="replace")
+
+
+def _ts_node_name(node, source_bytes: bytes, depth: int = 0) -> str | None:
+    """Best-effort: find an identifier inside ``node`` to label the chunk.
+
+    Strategy — in priority order:
+
+    1. Try the ``declarator`` field (function_definition, type_definition,
+       declarations). Walk down through nested declarator wrappers
+       (function_declarator, pointer_declarator, array_declarator) and
+       grab the innermost identifier — that's the real function/variable
+       name even when prefixed by macros tree-sitter mislabels.
+    2. Try the ``name`` field (struct_specifier, enum_specifier,
+       class_definition, etc.).
+    3. Fall back to DFS but reject ``_USELESS_MACRO_NAMES``.
+
+    Uses the tree-sitter-language-pack 1.8.1 method-style API.
+    """
+    # 1. declarator field
+    declarator = node.child_by_field_name("declarator")
+    if declarator is not None:
+        # Walk through wrapper declarators.
+        cur = declarator
+        for _ in range(6):
+            inner = cur.child_by_field_name("declarator")
+            if inner is None:
+                break
+            cur = inner
+        if cur.kind() in _IDENTIFIER_KINDS:
+            name = _ts_byte_text(cur, source_bytes)
+            if name not in _USELESS_MACRO_NAMES:
+                return name
+        # Wrapper didn't terminate in a bare identifier — search inside.
+        for i in range(cur.named_child_count()):
+            c = cur.named_child(i)
+            if c.kind() in _IDENTIFIER_KINDS:
+                name = _ts_byte_text(c, source_bytes)
+                if name not in _USELESS_MACRO_NAMES:
+                    return name
+
+    # 2. name field
+    name_node = node.child_by_field_name("name")
+    if name_node is not None and name_node.kind() in _IDENTIFIER_KINDS:
+        name = _ts_byte_text(name_node, source_bytes)
+        if name not in _USELESS_MACRO_NAMES:
+            return name
+
+    # 3. DFS fallback, skipping useless macro names.
+    return _ts_node_name_dfs(node, source_bytes, depth=0)
+
+
+def _ts_node_name_dfs(node, source_bytes: bytes, depth: int = 0) -> str | None:
+    if depth > 4:
+        return None
+    for i in range(node.named_child_count()):
+        child = node.named_child(i)
+        if child.kind() in _IDENTIFIER_KINDS:
+            name = _ts_byte_text(child, source_bytes)
+            if name not in _USELESS_MACRO_NAMES:
+                return name
+        nested = _ts_node_name_dfs(child, source_bytes, depth + 1)
+        if nested:
+            return nested
     return None
 
 
+def _leading_comment_start(lines: list[str], s: int) -> int:
+    """Walk up from line s-1 to find a contiguous leading comment block.
+
+    A "leading comment block" is consecutive lines (immediately preceding
+    line s, allowing blank lines BETWEEN comment lines) where each line
+    is either blank or starts with //, /*, *, or */. Stops at the first
+    non-comment non-blank line.
+
+    For kernel/Linux source, this is how kernel-doc, doxygen-style, and
+    plain /* ... */ banners above functions get pulled into the function's
+    chunk rather than orphaned.
+    """
+    comment_start = s
+    seen_comment = False
+    for cs in range(s - 1, -1, -1):
+        stripped = lines[cs].strip() if cs < len(lines) else ""
+        if not stripped:
+            # Blank line — accept ONLY if we've already entered the
+            # comment block (i.e., the comment had internal blank lines).
+            # Otherwise stop, because a blank line separates this function
+            # from whatever came before.
+            if seen_comment:
+                continue
+            break
+        if stripped.startswith(("//", "/*", "*/", "*")):
+            comment_start = cs
+            seen_comment = True
+        else:
+            break
+    return comment_start
+
+
 def _ts_chunks(text: str, language: str):
-    """Return [(line_start_1based, line_end_1based, name, chunk_text), ...] or None."""
+    """Return [(line_start_1based, line_end_1based, name, chunk_text), ...] or None.
+
+    Two improvements over a bare top-level walk:
+
+    1. Leading comments are attached to the function/struct/class they
+       precede (kernel-doc, doxygen, banner comments). Without this,
+       documentation that uses the same vocabulary as the function it
+       describes lives in an "uncovered" chunk-less limbo.
+    2. A "preamble" chunk captures everything before the first
+       chunkable node — #includes, file-level #defines, copyright
+       header, top-level typedefs that don't match TS_CHUNKABLE. This
+       material is often what tells the embedder what the file is
+       ABOUT (e.g. "this file includes <linux/sched/signal.h> and
+       defines TASK_RUNNING macros — it's about scheduling").
+    """
     parser = _get_ts_parser(language)
     if parser is None:
         return None
     types = TS_CHUNKABLE.get(language, set())
     if not types:
         return None
+    # tree-sitter-language-pack 1.8.1 expects a str (not bytes) and exposes
+    # method-style accessors: tree.root_node(), node.kind(),
+    # node.named_child_count() / named_child(i), node.start_position() /
+    # end_position() returning Point with .row/.column, node.byte_range()
+    # returning ByteRange with .start/.end. The classic tree_sitter
+    # property-style API (tree.root_node, node.children, node.type,
+    # node.start_point) doesn't apply here.
     source_bytes = text.encode("utf-8")
     try:
-        tree = parser.parse(source_bytes)
+        tree = parser.parse(text)
+        root = tree.root_node()
     except Exception:
         return None
     lines = text.splitlines(keepends=True)
 
     chunks: list[tuple[int, int, str, str]] = []
-    for child in tree.root_node.children:
-        if child.type not in types:
-            continue
-        s = child.start_point[0]  # 0-indexed
-        e = child.end_point[0]
-        chunk_text = "".join(lines[s:e + 1])
+    first_chunk_start_0idx: int | None = None
+
+    # Collect all chunkable nodes anywhere in the tree.
+    # Why recursive instead of top-level only:
+    # 1. Kernel/Linux source wraps most functions in `preproc_ifdef
+    #    CONFIG_*` blocks — top-level walk misses them.
+    # 2. tree-sitter's C parser frequently emits a giant ERROR node
+    #    spanning most of a file when it chokes on a macro, but valid
+    #    sub-trees (function_definitions etc.) are still recovered
+    #    *inside* that ERROR node.
+    # We don't descend into a node we already chunked — that would
+    # double-emit struct members, class methods, etc.
+    chunkable_nodes: list = []
+
+    def _collect(node):
+        for i in range(node.named_child_count()):
+            c = node.named_child(i)
+            if c.kind() in types:
+                chunkable_nodes.append(c)
+                # Don't recurse into a chunked node (no double-chunking).
+                continue
+            _collect(c)
+
+    _collect(root)
+    # Sort by source position so chunks appear in file order.
+    chunkable_nodes.sort(key=lambda n: n.start_position().row)
+
+    for child in chunkable_nodes:
+        s = child.start_position().row  # 0-indexed
+        e = child.end_position().row
+        # Pull leading comments into this chunk.
+        comment_start = _leading_comment_start(lines, s)
+        chunk_text = "".join(lines[comment_start:e + 1])
         name = _ts_node_name(child, source_bytes) or f"chunk-{s + 1}"
-        # Big node? sub-split via line windows but keep the function name as prefix.
         if len(chunk_text) > CHUNK_MAX_CHARS * 2:
             for (sub_s, sub_e, sub_id, sub_text) in _line_window_chunks(chunk_text):
-                chunks.append((s + sub_s, s + sub_e, f"{name}:{sub_id}", sub_text))
+                chunks.append((comment_start + sub_s, comment_start + sub_e,
+                              f"{name}:{sub_id}", sub_text))
         else:
-            chunks.append((s + 1, e + 1, name, chunk_text))
+            chunks.append((comment_start + 1, e + 1, name, chunk_text))
+        if first_chunk_start_0idx is None or comment_start < first_chunk_start_0idx:
+            first_chunk_start_0idx = comment_start
+
+    # Emit a preamble chunk for everything before the first chunkable node.
+    # Empty if the file starts directly with a function or has no chunkable
+    # content at all.
+    if first_chunk_start_0idx is not None and first_chunk_start_0idx > 0:
+        preamble_text = "".join(lines[:first_chunk_start_0idx])
+        if preamble_text.strip():
+            if len(preamble_text) > CHUNK_MAX_CHARS * 2:
+                # Big preamble (rare): split via line windows.
+                preamble_chunks = []
+                for (sub_s, sub_e, sub_id, sub_text) in _line_window_chunks(preamble_text):
+                    preamble_chunks.append(
+                        (sub_s, sub_e, f"preamble:{sub_id}", sub_text)
+                    )
+                chunks = preamble_chunks + chunks
+            else:
+                chunks.insert(0, (1, first_chunk_start_0idx, "preamble", preamble_text))
+
     return chunks or None
 
 

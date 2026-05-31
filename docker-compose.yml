@@ -42,7 +42,7 @@ services:
       # 16 GB card, fast ingest (~5 min for nginx-sized repos), code-aware.
       # Swap to qwen3-embedding:4b or :8b for better recall on nuanced
       # architectural questions when GPU headroom allows.
-      - EMBEDDING_MODEL_CODE=qwen3-embedding:0.6b
+      - EMBEDDING_MODEL_CODE=qwen3-embedding:8b
       # Comma-separated list of collections that route to EMBEDDING_MODEL_CODE
       # instead of EMBEDDING_MODEL. Add new code collections here.
       - EMBED_CODE_COLLECTIONS=nginx,linux-core,linux-mm,linux-fs,linux-net,linux-pci,linux-usb
@@ -68,7 +68,12 @@ services:
       # the fast model for decomposition by default.
       - QUERY_EXPANSION=true
       - MAX_SUBQUERIES=5
-      - AUTO_INGEST=true
+      # Temporarily false during the 2026-05-31 code-RAG optimisation
+      # bench pass — locks the corpus + server config while we A/B
+      # incremental upgrades (reranker, embedder, chunker). Flip back to
+      # true once the chosen pipeline is in place + remaining linux-*
+      # collections ready to ingest.
+      - AUTO_INGEST=false
       # Cross-encoder reranker (sidecar below). RAG degrades to fused order
       # if it is down/slow, so no depends_on is needed.
       - RERANKER_URL=http://127.0.0.1:8008/rerank
@@ -132,7 +137,7 @@ services:
       - ./storage/reranker:/cache
     environment:
       - PORT=8008
-      - RERANKER_MODEL=BAAI/bge-reranker-base
+      - RERANKER_MODEL=BAAI/bge-reranker-v2-m3
       - HF_HOME=/cache/hf
     command: >
       sh -lc "python -m venv /cache/venv 2>/dev/null || true;

@@ -27,6 +27,7 @@ storage/
 
 # Benchmark run outputs (the scripts + prompts.json are committed; results aren't)
 scripts/benchmark/results/
+scripts/code-bench/results/
 
 # SearXNG generated state (settings.yml IS committed; runtime artefacts aren't)
 searxng/secret_key

@@ -1,0 +1,87 @@
+{
+  "collection": "linux-core",
+  "topK": 10,
+  "_notes": [
+    "Each prompt's must_include_files is the set of repo-relative file paths that we expect AT LEAST ONE of to appear in the top-K retrieved chunks (substring match on the chunk's file_path metadata).",
+    "Scoring: HIT if any expected file appears, with hit position (1-indexed rank of the FIRST expected-file chunk).",
+    "These questions target linux-core specifically (kernel/, init/, include/linux/, include/uapi/linux/) — they avoid mm/, fs/, net/ which are separate collections.",
+    "Pinned to v6.12 LTS."
+  ],
+  "prompts": [
+    {
+      "id": "core-start-kernel",
+      "query": "Where is the linux kernel main entry point start_kernel defined, and what's the first major subsystem it initializes?",
+      "must_include_files": ["init/main.c"]
+    },
+    {
+      "id": "core-init-task",
+      "query": "How is init_task (the PID 0 idle task) defined and set up at boot?",
+      "must_include_files": ["init/init_task.c", "kernel/sched/core.c"]
+    },
+    {
+      "id": "core-scheduler-pick-next",
+      "query": "Where does the scheduler pick the next task to run? Show the pick_next_task function.",
+      "must_include_files": ["kernel/sched/core.c", "kernel/sched/fair.c"]
+    },
+    {
+      "id": "core-cfs-vruntime",
+      "query": "How does the CFS scheduler use vruntime to decide which task runs?",
+      "must_include_files": ["kernel/sched/fair.c"]
+    },
+    {
+      "id": "core-syscall-dispatch",
+      "query": "How are system calls dispatched? Where is the syscall table built?",
+      "must_include_files": ["kernel/sys.c", "include/linux/syscalls.h", "include/uapi/asm-generic/unistd.h"]
+    },
+    {
+      "id": "core-kthread-create",
+      "query": "How is a new kernel thread created with kthread_create?",
+      "must_include_files": ["kernel/kthread.c", "include/linux/kthread.h"]
+    },
+    {
+      "id": "core-workqueue-queue",
+      "query": "How does queue_work submit work to a workqueue, and how is the worker thread invoked?",
+      "must_include_files": ["kernel/workqueue.c", "include/linux/workqueue.h"]
+    },
+    {
+      "id": "core-rcu-grace-period",
+      "query": "How does RCU detect that a grace period has elapsed?",
+      "must_include_files": ["kernel/rcu/tree.c", "kernel/rcu/", "include/linux/rcupdate.h"]
+    },
+    {
+      "id": "core-spinlock-acquire",
+      "query": "How is a kernel spinlock acquired? Show the implementation of spin_lock for the non-debug case.",
+      "must_include_files": ["include/linux/spinlock.h", "include/linux/spinlock_api_smp.h", "kernel/locking/spinlock.c"]
+    },
+    {
+      "id": "core-mutex-lock",
+      "query": "How does mutex_lock handle contention and put the caller to sleep?",
+      "must_include_files": ["kernel/locking/mutex.c", "include/linux/mutex.h"]
+    },
+    {
+      "id": "core-wait-event",
+      "query": "What does the wait_event macro expand to and how does it sleep on a condition?",
+      "must_include_files": ["include/linux/wait.h", "kernel/sched/wait.c"]
+    },
+    {
+      "id": "core-printk",
+      "query": "How does printk emit messages and how does the ringbuffer behind it work?",
+      "must_include_files": ["kernel/printk/printk.c", "include/linux/printk.h"]
+    },
+    {
+      "id": "core-signal-delivery",
+      "query": "How is a signal delivered to a target task in the kernel?",
+      "must_include_files": ["kernel/signal.c", "include/linux/signal.h"]
+    },
+    {
+      "id": "core-fork",
+      "query": "Where is the fork system call implemented and how does copy_process duplicate a task?",
+      "must_include_files": ["kernel/fork.c"]
+    },
+    {
+      "id": "core-irq-handler",
+      "query": "How is an interrupt handler registered, and how is it dispatched when the IRQ fires?",
+      "must_include_files": ["kernel/irq/manage.c", "kernel/irq/handle.c", "kernel/irq/chip.c", "include/linux/interrupt.h"]
+    }
+  ]
+}

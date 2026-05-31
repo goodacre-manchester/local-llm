@@ -609,16 +609,48 @@ async function ingestCollection(name, { force = false } = {}) {
   const colId = await ensureCollection(name);
   const results = [];
 
+  // ── Phase 1: bulk-fetch existing chunk metadata so the skip-check is
+  // in-memory rather than N Chroma round-trips. On code collections with
+  // thousands of small files, per-file mtime checks dominate ingest time.
+  // One get with where:{fileName:{$in:[...]}}, include:["metadatas"]
+  // returns at most one row per chunk; we dedupe to one mtime per fileName.
+  let existingMtimeByFile = new Map();
+  if (!force) {
+    try {
+      const existing = await chromaRequest(`/api/v1/collections/${colId}/get`, {
+        method: "POST",
+        body: JSON.stringify({
+          where: { fileName: { $in: allDocs.map((d) => d.fileName) } },
+          include: ["metadatas"],
+        }),
+      });
+      for (const m of existing?.metadatas || []) {
+        if (m?.fileName && m?.mtime && !existingMtimeByFile.has(m.fileName)) {
+          existingMtimeByFile.set(m.fileName, m.mtime);
+        }
+      }
+    } catch (e) {
+      // Bulk fetch failed (e.g. body too large) — degrade gracefully:
+      // treat every file as needing re-ingest. Wasteful but correct.
+      console.warn(`[ingest] ${name}: bulk mtime-fetch failed (${e.message}); will re-process all files`);
+    }
+  }
+
+  // ── Phase 2: triage. Resolve mtime + preload sidecars; build the
+  // to-process list. The mtime-skip check uses the in-memory map above.
+  const toProcess = [];
   for (const { fileName, mode } of allDocs) {
-    let mtime;
-    let fullPath = null;
-    let preloadedSidecar = null;
+    let mtime, fullPath = null, preloadedSidecar = null;
     if (mode === "pdf") {
       fullPath = path.join(folderPath, fileName);
-      const stat = await fs.stat(fullPath);
-      mtime = stat.mtime.toISOString();
+      try {
+        mtime = (await fs.stat(fullPath)).mtime.toISOString();
+      } catch (e) {
+        console.warn(`[ingest] ${name}/${fileName}: stat failed: ${e.message}`);
+        results.push({ fileName, chunkCount: 0, failed: true });
+        continue;
+      }
     } else {
-      // Sidecar-only path: load once + use its source_mtime for the skip check.
       preloadedSidecar = await loadSidecar(folderPath, fileName);
       if (!preloadedSidecar) {
         console.warn(`[ingest] ${name}/${fileName}: sidecar unreadable — skipping`);
@@ -628,32 +660,66 @@ async function ingestCollection(name, { force = false } = {}) {
       mtime = preloadedSidecar.source_mtime || new Date().toISOString();
     }
 
-    if (!force && await isFileIngested(colId, fileName, mtime)) {
+    if (!force && existingMtimeByFile.get(fileName) === mtime) {
       pushEvent("ingest.progress", { state: "skipped", fileName, collection: name });
       results.push({ fileName, chunkCount: 0, skipped: true });
       continue;
     }
 
+    toProcess.push({ fileName, mode, mtime, sidecar: preloadedSidecar, fullPath });
+  }
+
+  // ── Phase 3: bulk-delete stale chunks for all files we'll re-process.
+  // One delete call instead of one per file. Stale = same fileName but old
+  // mtime; the new chunks land via upsert below.
+  if (toProcess.length > 0) {
+    try {
+      await chromaRequest(`/api/v1/collections/${colId}/delete`, {
+        method: "POST",
+        body: JSON.stringify({
+          where: { fileName: { $in: toProcess.map((d) => d.fileName) } },
+        }),
+      });
+    } catch (e) {
+      console.warn(`[ingest] ${name}: bulk stale-delete failed: ${e.message}`);
+    }
+  }
+
+  // ── Phase 4: cross-file chunk batching. Accumulate chunks into a flush
+  // buffer; flush as one embed + one upsert when full. This amortises
+  // per-batch overhead (HNSW insertion in Chroma, JSON parsing, HTTP
+  // round-trip) across many files. The previous per-file loop forced a
+  // ~2.5s upsert for every file even if it only had 1-3 chunks — on the
+  // Linux kernel collections (avg ~15 chunks/file), this dropped end-to-end
+  // throughput to ~46-233 chunks/min vs the embedder's 6000+ chunks/min
+  // capability. With FLUSH=256, the upsert overhead is paid ~16× less often.
+  const FLUSH_CHUNKS = 256;
+  let buf = { ids: [], documents: [], metadatas: [], embedInputs: [] };
+  let totalWritten = 0;
+
+  const flushBuf = async () => {
+    if (buf.embedInputs.length === 0) return;
+    const embeddings = await embedTexts(buf.embedInputs, "document", name);
+    await chromaRequest(`/api/v1/collections/${colId}/upsert`, {
+      method: "POST",
+      body: JSON.stringify({
+        ids: buf.ids,
+        documents: buf.documents,
+        metadatas: buf.metadatas,
+        embeddings,
+      }),
+    });
+    totalWritten += buf.ids.length;
+    pushEvent("ingest.progress", {
+      state: "batch-flushed", collection: name, written: totalWritten,
+    });
+    buf = { ids: [], documents: [], metadatas: [], embedInputs: [] };
+  };
+
+  for (const { fileName, mode, mtime, sidecar: preloadedSidecar, fullPath } of toProcess) {
     pushEvent("ingest.progress", { state: "started", fileName, collection: name });
 
     try {
-      // Remove stale chunks for this file before re-ingesting
-      try {
-        const old = await chromaRequest(`/api/v1/collections/${colId}/get`, {
-          method: "POST",
-          body: JSON.stringify({ where: { fileName }, include: [] })
-        });
-        if (old?.ids?.length) {
-          await chromaRequest(`/api/v1/collections/${colId}/delete`, {
-            method: "POST",
-            body: JSON.stringify({ ids: old.ids })
-          });
-        }
-      } catch { /* ignore — collection may be empty */ }
-
-      // Prefer the structure-aware sidecar (tables/pages/sections preserved);
-      // fall back to flat pdf-parse text if a PDF hasn't been extracted yet.
-      // Sidecar-only mode already loaded the sidecar above for mtime; reuse it.
       const sidecar = preloadedSidecar || await loadSidecar(folderPath, fileName);
       let chunks, source;
       if (sidecar) {
@@ -666,77 +732,60 @@ async function ingestCollection(name, { force = false } = {}) {
           .map((t) => ({ text: t, page: null, section: "", blockType: "text", embedInput: t }));
         source = "pdf-parse (no sidecar — run scripts/extract-pdfs.ps1 for citations)";
       } else {
-        // Sidecar-only mode but sidecar gone between discovery + load — shouldn't happen.
         throw new Error(`sidecar disappeared mid-ingest: ${fileName}`);
       }
 
-      // Embed + upsert in batches: large datasheets produce tens of thousands
-      // of chunks — a single upsert would be a >100 MB JSON body. Batching
-      // bounds memory/request size and gives incremental progress.
-      const BATCH = 64;
-      let written = 0;
-      for (let s = 0; s < chunks.length; s += BATCH) {
-        const slice = chunks.slice(s, s + BATCH);
-        // One embed call for the whole batch (vs one per chunk) — the ingest
-        // hot path; ~10x fewer round-trips on large corpora.
-        const embeddings = await embedTexts(slice.map((c) => c.embedInput || c.text), "document", name);
-        const ids = [], documents = [], metadatas = [];
-        for (let j = 0; j < slice.length; j++) {
-          const c = slice[j];
-          const i = s + j;
-          ids.push(`${name}:${fileName}:${i}`);
-          documents.push(c.text);
-          metadatas.push({
-            fileName, chunkIndex: i, collection: name, mtime,
-            page: c.page ?? null, section: c.section || "", blockType: c.blockType || "text",
-          });
-        }
-        if (ids.length) {
-          await chromaRequest(`/api/v1/collections/${colId}/upsert`, {
-            method: "POST",
-            body: JSON.stringify({ ids, documents, metadatas, embeddings })
-          });
-          written += ids.length;
-        }
-        pushEvent("ingest.progress", {
-          state: "embedding", fileName, collection: name, done: written, total: chunks.length,
+      for (let i = 0; i < chunks.length; i++) {
+        const c = chunks[i];
+        buf.ids.push(`${name}:${fileName}:${i}`);
+        buf.documents.push(c.text);
+        buf.metadatas.push({
+          fileName, chunkIndex: i, collection: name, mtime,
+          page: c.page ?? null, section: c.section || "", blockType: c.blockType || "text",
         });
+        buf.embedInputs.push(c.embedInput || c.text);
+        if (buf.embedInputs.length >= FLUSH_CHUNKS) {
+          await flushBuf();
+        }
       }
 
-      pushEvent("ingest.progress", { state: "completed", fileName, chunkCount: chunks.length, collection: name, source });
+      pushEvent("ingest.progress", {
+        state: "completed", fileName, chunkCount: chunks.length, collection: name, source,
+      });
       results.push({ fileName, chunkCount: chunks.length });
     } catch (err) {
-      // One bad file (e.g. a pathological table) must not abort the whole
-      // collection — record it and move on.
+      // One bad file must not abort the whole collection.
       console.error(`[ingest] ${name}/${fileName} failed:`, err.message);
       pushEvent("ingest.progress", { state: "error", fileName, collection: name, error: String(err) });
       results.push({ fileName, chunkCount: 0, error: String(err), failed: true });
     }
   }
 
-  // Prune chunks for files that no longer exist (deleted/renamed PDFs or
-  // removed source files in code collections). Per-file ingest only
-  // deletes-then-reinserts files that still exist, so a removed file would
-  // otherwise leave stale chunks polluting retrieval forever. The valid
-  // set is the union of current PDFs + current sidecar-only filenames.
-  const validFileNames = allDocs.map((d) => d.fileName);
+  // Final flush for whatever's still buffered.
+  await flushBuf();
+
+  // ── Phase 5: orphan prune. Drop chunks for files that no longer exist
+  // (deleted/renamed PDFs or removed source files). The valid set is the
+  // union of currently-discovered PDFs + sidecar-only filenames.
   try {
     await chromaRequest(`/api/v1/collections/${colId}/delete`, {
       method: "POST",
-      body: JSON.stringify({ where: { fileName: { $nin: validFileNames } } }),
+      body: JSON.stringify({
+        where: { fileName: { $nin: allDocs.map((d) => d.fileName) } },
+      }),
     });
   } catch (e) {
     console.error(`[ingest] orphan prune failed for ${name}:`, e.message);
   }
 
-  // (Re)ingest or prune invalidates the lexical index so it rebuilds clean.
+  // (Re)ingest invalidates the lexical index so it rebuilds clean.
   bm25Cache.delete(name);
 
   return {
     collection: name,
     files: allDocs.length,
     totalChunks: results.reduce((s, r) => s + r.chunkCount, 0),
-    results
+    results,
   };
 }
 

@@ -68,12 +68,7 @@ services:
       # the fast model for decomposition by default.
       - QUERY_EXPANSION=true
       - MAX_SUBQUERIES=5
-      # Temporarily false during the 2026-05-31 code-RAG optimisation
-      # bench pass — locks the corpus + server config while we A/B
-      # incremental upgrades (reranker, embedder, chunker). Flip back to
-      # true once the chosen pipeline is in place + remaining linux-*
-      # collections ready to ingest.
-      - AUTO_INGEST=false
+      - AUTO_INGEST=true
       # Cross-encoder reranker (sidecar below). RAG degrades to fused order
       # if it is down/slow, so no depends_on is needed.
       - RERANKER_URL=http://127.0.0.1:8008/rerank

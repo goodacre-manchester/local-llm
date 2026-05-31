@@ -204,3 +204,91 @@ Interpretation:
 
 Each per-prompt JSON includes the full retrieved top-10 (with metadata)
 and the chat answer + citations.
+
+---
+
+## CoIR public-benchmark scoring (in progress)
+
+The internal `linux-core-prompts.json` bench above measures the *full
+pipeline* on architectural kernel questions. It is not directly
+comparable to public leaderboards. To get a comparable number, we also
+run our embedder against the **CoIR** benchmark
+([leaderboard](https://archersama.github.io/coir/)). The harness lives
+at `scripts/code-bench/coir-run.py`; per-task JSONs land under
+`scripts/code-bench/coir-results/qwen3-embedding-0.6b/`.
+
+CoIR's evaluation methodology is **embedder-only** — embed the corpus,
+embed the queries, do dense kNN, score nDCG@10. No reranker is in the
+loop (matches how the leaderboard scores published entries).
+
+### Results so far (qwen3-embedding:0.6b)
+
+| CoIR task | corpus / queries | our nDCG@10 | leaderboard top | notes |
+|---|---|---|---|---|
+| cosqa | 20,604 / 500 | **0.3939** | SFR-Embedding-Code-2B_R: 0.3631 | Clean: above the published SOTA entry; cosqa is Stack Overflow-style and unlikely to have leaked into Qwen3 pre-training. |
+| codetrans-contest | (small) | **0.9077** | typical SOTA: ~0.55–0.70 | **Suspect: contamination.** Score is far above any leaderboard entry. codetrans corpus is from open-source competitive programming archives that Qwen3 was very likely trained on. |
+| CodeSearchNet-python | 14,918 / 1,046 | **0.9079** | top SOTA entries ~0.80–0.85 | **Suspect: contamination.** CSN is one of the most-cited public code datasets; near-certain Qwen3 saw it during pre-training. |
+
+### Interpretation
+
+cosqa is the only one of the three completed tasks that gives a clean
+signal — and on that signal our 0.6B embedder *exceeds* the published
+SOTA (SFR-Embedding-Code-2B_R, a 2B-parameter code-specialised model).
+
+The two suspect scores aren't a methodology bug — the corpus/query
+counts match CoIR's published splits, the harness wires the same DRES
++ nDCG@10 path the leaderboard uses, and the cosqa score is in a
+believable range. The likely explanation is benchmark leakage:
+Qwen3-Embedding was trained on a code corpus that includes (or
+substantially overlaps with) CSN-python and codetrans-contest, so
+those tasks reduce to memorisation. This is a general failure mode of
+public benchmarks for foundation-model-scale embedders — not unique
+to us — and the CoIR authors flag this risk in the paper.
+
+The conclusion we can draw safely:
+
+* **The 0.6B embedder is competitive with the CoIR top entries on
+  tasks that aren't contaminated.**
+* Trying to claim "we beat SOTA on CoIR overall" from the two suspect
+  scores would be dishonest.
+
+### Remaining tasks (paused mid-run 2026-05-31)
+
+Outstanding when the run was paused to free WSL memory for another
+build:
+
+* `codefeedback-st` — small task, expected to give a clean signal
+  (synthetic feedback-style queries, less likely in pre-training).
+* `stackoverflow-qa` — medium task, also likely to be clean.
+
+The runner skips tasks whose JSON is already on disk, so resuming with
+the same command list re-runs only what's missing.
+
+### Resume command
+
+```bash
+wsl -e bash -lc "cd /mnt/d/Projects/local-llm && \
+  source scripts/extract/.venv/bin/activate && \
+  python3 -u scripts/code-bench/coir-run.py \
+    CodeSearchNet-python codetrans-contest codefeedback-st stackoverflow-qa"
+```
+
+(Each task's existence-check is `coir-results/<model>/<task>.json` —
+delete that file if you want to re-run a task.)
+
+### Planned follow-ups (post-resume)
+
+1. After the two outstanding tasks complete, decide whether to run a
+   wider subset (CSN-go, CSN-java, CSN-javascript, codetrans-dl, apps)
+   or stop here. The wider subset only helps if we want a CoIR
+   *average* number; the contamination caveat still applies.
+2. **Add a reranker variant.** Pull top-K=40 with our embedder, send
+   the candidates through the local `bge-reranker-v2-m3` sidecar,
+   re-score. Measures whether the reranker step helps on
+   CodeSearchNet-style code retrieval the way it helped on our
+   architectural-question bench. ~half-day of work; needs a small
+   extension to `coir-run.py`.
+3. **Pull `nomic-embed-code`** through the same harness as a
+   side-by-side. It published only CodeSearchNet-MRR (not CoIR), and a
+   second data point would tell us whether contamination affects it
+   similarly.

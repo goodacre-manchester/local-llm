@@ -372,6 +372,11 @@ services:
   nemo-parse:
     image: vllm/vllm-openai:v0.21.0-cu129-ubuntu2404
     container_name: local-llm-nemo-parse
+    # Excluded from the default `docker compose up -d` (and the local-llm.service
+    # boot unit) — see the DEPRECATED note above. The live PDF extraction path is
+    # the host-side scripts/extract/extract-nemo.ps1, not this container. To run
+    # it anyway (e.g. a revival re-attempt): `docker compose --profile nemo up -d nemo-parse`.
+    profiles: ["nemo"]
     ports:
       - "8009:8000"
     environment:

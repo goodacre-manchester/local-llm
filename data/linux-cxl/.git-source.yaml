@@ -1,0 +1,18 @@
+# Linux kernel CXL (Compute Express Link) subsystem: drivers, shared
+# headers, driver-API docs, and the userspace-side mock test models.
+# Sparse-checkout of Linus's tree pinned at 6.12 LTS.
+#
+# Pairs with `seccom`'s CXL-Specification rev 3.2 PDF: spec lives in
+# seccom, kernel implementation lives here. A host application can
+# drive both collections per chat to cross-reference standard vs
+# implementation.
+
+url: https://github.com/torvalds/linux.git
+ref: v6.12
+
+sparse_paths:
+  - drivers/cxl/
+  - include/cxl/
+  - include/uapi/linux/cxl_mem.h
+  - Documentation/driver-api/cxl/
+  - tools/testing/cxl/

@@ -45,7 +45,7 @@ services:
       - EMBEDDING_MODEL_CODE=qwen3-embedding:0.6b
       # Comma-separated list of collections that route to EMBEDDING_MODEL_CODE
       # instead of EMBEDDING_MODEL. Add new code collections here.
-      - EMBED_CODE_COLLECTIONS=nginx,linux-core,linux-mm,linux-fs,linux-net,linux-pci,linux-usb
+      - EMBED_CODE_COLLECTIONS=nginx,linux-core,linux-mm,linux-fs,linux-net,linux-pci,linux-usb,linux-bt,linux-cxl
       # Fast default + opt-in deep (request "<collection>!deep"). See §5.3.
       - CHAT_MODEL=gemma4:e4b
       # 2026-05-25: promoted from qwen2.5-coder:32b-instruct-q4_K_M per the

@@ -1,0 +1,18 @@
+# Linux kernel Bluetooth subsystem: the core stack (net/bluetooth/),
+# HCI transport drivers (drivers/bluetooth/), shared headers, and the
+# bluez-side documentation. Sparse-checkout of Linus's tree pinned at
+# 6.12 LTS.
+#
+# Pairs with `seccom`'s BT-Core_v6.0.pdf: spec lives in seccom, kernel
+# implementation lives here. A host application can drive both
+# collections per chat to cross-reference standard vs implementation.
+
+url: https://github.com/torvalds/linux.git
+ref: v6.12
+
+sparse_paths:
+  - net/bluetooth/
+  - drivers/bluetooth/
+  - include/net/bluetooth/
+  - include/uapi/linux/bluetooth/
+  - Documentation/networking/bluetooth/

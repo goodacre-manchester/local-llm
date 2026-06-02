@@ -207,7 +207,7 @@ and the chat answer + citations.
 
 ---
 
-## CoIR public-benchmark scoring (in progress)
+## CoIR public-benchmark scoring (concluded)
 
 The internal `linux-core-prompts.json` bench above measures the *full
 pipeline* on architectural kernel questions. It is not directly
@@ -252,19 +252,24 @@ The conclusion we can draw safely:
 * Trying to claim "we beat SOTA on CoIR overall" from the two suspect
   scores would be dishonest.
 
-### Remaining tasks (paused mid-run 2026-05-31)
+### Why we stopped here
 
-Outstanding when the run was paused to free WSL memory for another
-build:
+The remaining queued tasks (`codefeedback-st`, `stackoverflow-qa`) and
+the planned reranker / `nomic-embed-code` variants were dropped. The
+question the bench was meant to answer — *"how does our solution
+compare vs SOTA"* — is settled by the cosqa number on its own:
+on the one clean task, the 0.6B embedder is at the top of the public
+leaderboard. Extending the run would have added 1–2 more "we beat /
+match SOTA" data points or an academic "does the reranker help on
+CoIR-style queries" measurement, neither of which would change a
+pipeline decision. The reranker stays in production because it won on
+the *actual* workload (the internal bench above), not because of any
+CoIR score we'd add later.
 
-* `codefeedback-st` — small task, expected to give a clean signal
-  (synthetic feedback-style queries, less likely in pre-training).
-* `stackoverflow-qa` — medium task, also likely to be clean.
-
-The runner skips tasks whose JSON is already on disk, so resuming with
-the same command list re-runs only what's missing.
-
-### Resume command
+If a future need arises (e.g. justifying the pipeline against a new
+SOTA contender, or a re-bench after swapping the embedder), the
+harness is committed and the runner skips tasks whose JSON already
+exists. Resume command for the record:
 
 ```bash
 wsl -e bash -lc "cd /mnt/d/Projects/local-llm && \
@@ -272,23 +277,3 @@ wsl -e bash -lc "cd /mnt/d/Projects/local-llm && \
   python3 -u scripts/code-bench/coir-run.py \
     CodeSearchNet-python codetrans-contest codefeedback-st stackoverflow-qa"
 ```
-
-(Each task's existence-check is `coir-results/<model>/<task>.json` —
-delete that file if you want to re-run a task.)
-
-### Planned follow-ups (post-resume)
-
-1. After the two outstanding tasks complete, decide whether to run a
-   wider subset (CSN-go, CSN-java, CSN-javascript, codetrans-dl, apps)
-   or stop here. The wider subset only helps if we want a CoIR
-   *average* number; the contamination caveat still applies.
-2. **Add a reranker variant.** Pull top-K=40 with our embedder, send
-   the candidates through the local `bge-reranker-v2-m3` sidecar,
-   re-score. Measures whether the reranker step helps on
-   CodeSearchNet-style code retrieval the way it helped on our
-   architectural-question bench. ~half-day of work; needs a small
-   extension to `coir-run.py`.
-3. **Pull `nomic-embed-code`** through the same harness as a
-   side-by-side. It published only CodeSearchNet-MRR (not CoIR), and a
-   second data point would tell us whether contamination affects it
-   similarly.

@@ -34,13 +34,6 @@ Re-ask the question with the defining clause number explicit (*"summarise Clause
 
 ## Pending tasks (next session)
 
-- **Resume the CoIR public-benchmark run.** Paused 2026-05-31 to free WSL DRAM. 3 of 5 queued tasks finished (cosqa 0.39 = above SOTA, CSN-python + codetrans-contest 0.91 = contamination-suspect). Outstanding: `codefeedback-st`, `stackoverflow-qa`. Full status + resume command + planned follow-ups (reranker variant, nomic-embed-code side-by-side) in [`scripts/code-bench/BENCHMARK-RESULTS.md`](scripts/code-bench/BENCHMARK-RESULTS.md) under "CoIR public-benchmark scoring".
-  ```bash
-  # Boot WSL + docker (any wsl command boots the VM)
-  wsl -e bash -lc "cd /mnt/d/Projects/local-llm && sudo docker compose up -d"
-  # Resume CoIR — runner skips already-completed tasks
-  wsl -e bash -lc "cd /mnt/d/Projects/local-llm && source scripts/extract/.venv/bin/activate && python3 -u scripts/code-bench/coir-run.py CodeSearchNet-python codetrans-contest codefeedback-st stackoverflow-qa"
-  ```
 - **Investigate second 5070 Ti impact** (if installed). With 32 GB total VRAM the deep model fits fully and the per-workflow GPU contention disappears. Expected measurements to capture as a baseline vs single-card:
   - `!deep` profile latency on a known prompt — expected ~2–3 min → ~30–60 s as `nemotron-3-nano:30b-a3b-q4_K_M` (~24 GB) stops spilling ~8 GB to system RAM.
   - VLM captioning rate — expected ~30–45 s/pic → ~15–25 s/pic, and no longer requires `docker compose stop sd-webui` first.

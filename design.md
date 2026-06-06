@@ -85,7 +85,10 @@ The final command confirms the NVIDIA Container Toolkit is wired into the Docker
 │   │   ├── server.py               # bge-reranker-base sidecar
 │   │   └── requirements.txt
 │   ├── nemo-rag/server.py          # optional manual Nemotron embed+rerank sidecar
-│   ├── rag-mcp/                    # stdio MCP server (editor integration)
+│   ├── rag-mcp/                    # MCP servers wrapping the rag-server
+│   │   ├── index.js                # stdio (4-tool, editor integration)
+│   │   ├── http-server.js          # Streamable HTTP (1-tool rag_search, LAN)
+│   │   └── package.json            # shared deps (@modelcontextprotocol/sdk)
 │   └── benchmark/                  # regression-guard prompt suite
 ├── searxng/
 │   └── settings.yml                # curated engine list for Web Search
@@ -361,6 +364,10 @@ Downloads `Juggernaut-XL_v9_RunDiffusionPhoto_v2.safetensors` (~6.6 GB) into `st
 
 ### 6.8 MCP server dependencies
 
+The HTTP variant's `rag-mcp` compose service runs `npm install --omit=dev` on first boot against the bind-mounted `scripts/rag-mcp/`, so no host-side install is needed for the LAN endpoint.
+
+The editor-side stdio variant (`.vscode/mcp.json` → `node scripts/rag-mcp/index.js`) is spawned outside Docker, so VS Code on the Windows host needs its node_modules populated once. The compose-driven install handles this too because both scripts share `scripts/rag-mcp/node_modules`. To force a refresh after editing `package.json`:
+
 ```powershell
 .\scripts\wsl-run.ps1 "cd scripts/rag-mcp && npm install"
 ```
@@ -521,7 +528,7 @@ If `RAG_API_KEY` is set, use that exact value as the connection's API key and al
 
 ## 9. LAN Access (Optional)
 
-Four ports can be exposed to other devices on the LAN: open-webui (`8080`), sd-webui (`7860`), rag-server (`3000`), Ollama (`11434`). `chroma` (`8000`) and `reranker` (`8008`) stay internal.
+Five ports can be exposed to other devices on the LAN: open-webui (`8080`), sd-webui (`7860`), rag-server (`3000`), rag-mcp (`3001`), Ollama (`11434`). `chroma` (`8000`), `reranker` (`8008`), and SearXNG (`8888`) stay internal.
 
 ### 9.1 WSL mirrored networking
 
@@ -555,7 +562,7 @@ In PowerShell as Administrator:
 ```powershell
 New-NetFirewallRule -DisplayName "local-llm stack (LAN)" `
   -Direction Inbound -Action Allow -Protocol TCP `
-  -LocalPort 3000,7860,8080,11434 `
+  -LocalPort 3000,3001,7860,8080,11434 `
   -Profile Domain,Private -Enabled True
 ```
 
@@ -566,7 +573,7 @@ WSL2 mirrored mode also maintains a separate Hyper-V Firewall layer. The standar
 ```powershell
 New-NetFirewallHyperVRule -Name "local-llm-stack-lan" -DisplayName "local-llm stack (HV)" `
   -Direction Inbound -VMCreatorId '{40E0AC32-46A5-438A-A0B2-2B479E8F2E90}' `
-  -Protocol TCP -LocalPorts 3000,7860,8080,11434 -Action Allow
+  -Protocol TCP -LocalPorts 3000,3001,7860,8080,11434 -Action Allow
 ```
 
 ### 9.4 Validate from another device
@@ -579,13 +586,55 @@ Test from a peer machine, not the Windows host itself. In mirrored mode, the hos
 | `http://<lan-ip>:7860` | A1111 UI |
 | `http://<lan-ip>:11434/api/tags` | JSON model list |
 | `http://<lan-ip>:3000/v1/models` | JSON RAG collection list |
+| `http://<lan-ip>:3001/health` | `{"ok":true,"rag":"http://127.0.0.1:3000"}` (MCP HTTP transport, no auth) |
 
 ### 9.5 Security on LAN
 
 - Open WebUI gates LAN access with `WEBUI_AUTH=true`.
 - rag-server and Ollama are unauthenticated by default. If the LAN is not fully trusted, set `RAG_API_KEY` on rag-server and omit `11434` from the firewall rule (Ollama has no built-in auth).
+- rag-mcp (`3001`) is unauthenticated by default. Set `MCP_AUTH_TOKEN` in `.env` (gitignored) to require `Authorization: Bearer <token>` on `/mcp`; `/health` stays open. The same `RAG_API_KEY`, if set, is forwarded on upstream calls so the MCP server can talk to a key-gated rag-server.
 - sd-webui (`WEB_ENABLE_AUTH=false`) is local-only image generation; safe on a trusted LAN.
 - SearXNG (`8888`) and the internal services `chroma` (`8000`) and `reranker` (`8008`) are intentionally NOT in the firewall rule. They serve Open WebUI / rag-server over `127.0.0.1` only.
+
+## 9a. MCP Surface
+
+The rag-server is wrapped by two MCP servers — one per consumer pattern. Both share `scripts/rag-mcp/node_modules` and the upstream `@modelcontextprotocol/sdk` dependency.
+
+### 9a.1 Editor variant — `scripts/rag-mcp/index.js`
+
+- **Transport:** stdio (spawned as a subprocess by the consumer).
+- **Tools:**
+  - `query_pdfs(query, collection?, topK?, deep?)` — proxies `POST /v1/chat/completions`, returns the LLM-synthesised answer + collection name.
+  - `list_collections()` — proxies `GET /collections`.
+  - `set_active_collection(name)` — proxies `PUT /active-collection`.
+  - `ingest_collection(name, force?)` — proxies `POST /collections/<name>/ingest`.
+- **Registration:** `.vscode/mcp.json` runs `node scripts/rag-mcp/index.js` with `RAG_BASE_URL=http://127.0.0.1:3000`.
+- **Why this surface:** editor workflows want full answers ("what does this datasheet say about X?") plus the ops verbs (switch collection, kick off ingest after dropping new PDFs in).
+
+### 9a.2 External-agent variant — `scripts/rag-mcp/http-server.js`
+
+- **Transport:** Streamable HTTP (`POST /mcp` + SSE) at `http://<host>:3001/mcp`, plus `GET /health` for liveness probes.
+- **Mode:** stateless — every request builds a fresh `(Server, StreamableHTTPServerTransport)` pair, so cross-request state can't leak and the server survives both client-side reconnects and headless clients that never call `initialize`.
+- **Tools:** **single** — `rag_search(collection, query, top_k=8)`. Proxies `POST /query`, returns each chunk as `{text, score, fileName, section, page, file_path?, github_url?}`. Caller synthesises its own answer.
+- **Dynamic catalogue:** the tool's `collection` parameter ships its `enum` rebuilt from `/v1/models` on each `tools/list` request (cached for 30 s). New collections appear automatically; no compose recreate, no code change.
+- **Compose service:** `rag-mcp` (node:20-slim, `network_mode: host`, depends_on rag-server). `npm install` runs in-place against the bind-mounted `scripts/rag-mcp/`; subsequent boots are near-instant.
+- **Auth:** optional bearer token via `MCP_AUTH_TOKEN` env (sourced from project-root `.env`). Clients must send `Authorization: Bearer <token>` on `/mcp`. `/health` is always open.
+- **Why a separate variant:** another agent reaching the stack over the LAN — a Claude Code instance on a peer machine, the Anthropic SDK with `mcp_servers`, Claude Desktop — wants the chunks, not a pre-baked answer, so its own model can ground a response in its own context. Removing the LLM hop also cuts a `query_pdfs` call from ~60s to ~5s.
+
+### 9a.3 Client configuration sample
+
+```json
+// ~/.claude/settings.json on a peer machine
+{
+  "mcpServers": {
+    "local-rag": {
+      "type": "http",
+      "url": "http://192.168.0.83:3001/mcp",
+      "headers": { "Authorization": "Bearer ${MCP_AUTH_TOKEN}" }
+    }
+  }
+}
+```
 
 ## 10. Operational Reference
 

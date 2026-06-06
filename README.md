@@ -223,15 +223,38 @@ Latency budget: ~3–10 s for search + Playwright fetch + embed; the rest is the
 
 Privacy note: queries (not chat content) egress to the external search engines that SearXNG aggregates. The LLM, embeddings, page fetcher, and ranker all run locally.
 
-### Editor integration (MCP)
+### MCP (editor + external agents)
 
-`scripts/rag-mcp/` is a stdio MCP server registered in `.vscode/mcp.json`. Tools: `query_pdfs`, `list_collections`, `set_active_collection`, `ingest_collection`. The `query_pdfs` tool takes a `deep` boolean for the deep profile.
+Two MCP servers expose the RAG collections to different consumers:
 
-If you set `RAG_API_KEY` on the rag-server, add the same value to the `env` block of `.vscode/mcp.json`.
+| variant | transport | tools | who connects |
+|---|---|---|---|
+| [scripts/rag-mcp/index.js](scripts/rag-mcp/index.js) | **stdio** | `query_pdfs` (full LLM-synthesised answer), `list_collections`, `set_active_collection`, `ingest_collection` | this machine's editor (VS Code via `.vscode/mcp.json`) |
+| [scripts/rag-mcp/http-server.js](scripts/rag-mcp/http-server.js) | **Streamable HTTP** on `:3001` | single tool `rag_search(collection, query, top_k=8)` — retrieval only, returns top-K chunks + metadata; the caller synthesises | external agents on the LAN (a second Claude Code instance, the Anthropic SDK with `mcp_servers`, Claude Desktop, Cursor, Continue, …) |
+
+The HTTP variant runs as the `rag-mcp` Docker service (auto-started by compose) on port 3001 — endpoint `http://<host>:3001/mcp`, health probe `http://<host>:3001/health`. Tool catalogue is dynamic: the `collection` enum is rebuilt from `/v1/models` on each request so newly-added collections appear automatically.
+
+**Connect an external Claude Code instance:**
+```json
+// ~/.claude/settings.json on the consuming machine
+{
+  "mcpServers": {
+    "local-rag": {
+      "type": "http",
+      "url": "http://192.168.0.83:3001/mcp",
+      "headers": { "Authorization": "Bearer ${MCP_AUTH_TOKEN}" }
+    }
+  }
+}
+```
+
+**Optional bearer auth.** Set `MCP_AUTH_TOKEN` in a project-root `.env` (gitignored) to require `Authorization: Bearer <token>` on every `/mcp` call. The `/health` endpoint stays open for liveness probes. If the upstream rag-server also requires a key, set `RAG_API_KEY` and both variants forward it upstream.
+
+**For editor integration on this machine**, the stdio variant takes precedence — `.vscode/mcp.json` registers `node scripts/rag-mcp/index.js` and the four-tool surface (richer than HTTP) is what's exposed to GitHub Copilot / VS Code.
 
 ### LAN access (optional)
 
-Four ports can be exposed to other devices on the LAN: `8080` (chat UI), `7860` (image gen UI), `3000` (RAG API), `11434` (Ollama API). The full procedure (WSL mirrored networking, Ollama bind change, single firewall rule, security trade-offs) is in **[design.md §9](design.md)**.
+Five ports can be exposed to other devices on the LAN: `8080` (chat UI), `7860` (image gen UI), `3000` (RAG API), `3001` (RAG MCP), `11434` (Ollama API). The full procedure (WSL mirrored networking, Ollama bind change, single firewall rule, security trade-offs) is in **[design.md §9](design.md)**.
 
 ## Acknowledged Limitation
 

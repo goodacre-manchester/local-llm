@@ -154,6 +154,60 @@ services:
       # First boot pip-installs torch + downloads the reranker model.
       start_period: 600s
 
+  # rag-mcp — Model Context Protocol server (Streamable HTTP transport) that
+  # exposes the rag-server's /query endpoint as a single MCP tool
+  # `rag_search`. This is the LAN-exposed front door for *external* agents
+  # (a Claude Code instance on another machine, the Anthropic SDK with
+  # mcp_servers config, Claude Desktop, Cursor, Continue, etc.) to ground
+  # answers on the local RAG collections without spending an LLM call on
+  # synthesis. Returns top-K chunks + metadata; the caller does the
+  # answering.
+  #
+  # Editor integration on this machine continues to use the stdio variant
+  # (scripts/rag-mcp/index.js, registered in .vscode/mcp.json) which offers
+  # the richer 4-tool surface (query_pdfs, list_collections,
+  # set_active_collection, ingest_collection). Both servers share
+  # node_modules under scripts/rag-mcp/.
+  #
+  # Endpoint: http://<host>:3001/mcp  (and /health for a no-auth probe).
+  # Optional MCP_AUTH_TOKEN gates the /mcp endpoint with a bearer header.
+  rag-mcp:
+    image: node:20-slim
+    container_name: local-llm-rag-mcp
+    restart: unless-stopped
+    working_dir: /app
+    network_mode: host
+    volumes:
+      - ./scripts/rag-mcp:/app
+    environment:
+      - RAG_BASE_URL=http://127.0.0.1:3000
+      - MCP_HTTP_PORT=3001
+      - MCP_HTTP_HOST=0.0.0.0
+      # If set, clients must present `Authorization: Bearer <value>`.
+      # Pull from a project-root .env (gitignored). Leave blank for unauthenticated.
+      - MCP_AUTH_TOKEN=${MCP_AUTH_TOKEN:-}
+      # If the rag-server itself ever requires a bearer token, mirror it here
+      # so the MCP server forwards it on upstream calls.
+      - RAG_API_KEY=${RAG_API_KEY:-}
+    command: >
+      sh -lc "npm install --no-audit --no-fund --omit=dev &&
+              exec node http-server.js"
+    depends_on:
+      rag-server:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:3001/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+        ]
+      interval: 20s
+      timeout: 5s
+      retries: 8
+      start_period: 60s
+
   open-webui:
     image: ghcr.io/open-webui/open-webui:main
     container_name: local-llm-open-webui

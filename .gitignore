@@ -29,6 +29,10 @@ storage/
 scripts/benchmark/results/
 scripts/code-bench/results/
 
+# XTAB conformance-audit working output (local audit artefacts; read-only XTAB
+# tree is external, these are regenerable per-spec analysis files)
+xtab-files/
+
 # SearXNG generated state (settings.yml IS committed; runtime artefacts aren't)
 searxng/secret_key
 searxng/uwsgi.ini

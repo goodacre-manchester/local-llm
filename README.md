@@ -22,6 +22,7 @@ The stack is **local-only for inference**: no cloud LLM calls, no telemetry. The
 | **Web grounding** | Per-chat globe-icon toggle. Self-hosted SearXNG aggregates Google/Bing/DDG + Wikipedia/arXiv/Scholar/Stack Overflow + news engines; Open WebUI fetches the top pages via Playwright (handles cookie walls), embeds them, and feeds the most relevant chunks to the LLM with inline citations. Works with any Ollama model. |
 | **Editor integration** | An MCP server (`scripts/rag-mcp`) exposes the RAG collections as tools (`query_pdfs`, `list_collections`, …) for IDEs. |
 | **LAN access** | Four ports (chat UI, image gen UI, RAG API, Ollama API) can be opened to the local network with a single Windows Firewall rule. |
+| **Remote access** | A single off-LAN agent can reach the RAG MCP endpoint over Tailscale — scoped to just that port, no router port-forward, no general LAN access. |
 | **Self-restarting** | Windows Startup-folder launcher brings the stack up on every logon; containers use `restart: unless-stopped`. |
 
 ## Services and URLs
@@ -255,6 +256,10 @@ The HTTP variant runs as the `rag-mcp` Docker service (auto-started by compose) 
 ### LAN access (optional)
 
 Five ports can be exposed to other devices on the LAN: `8080` (chat UI), `7860` (image gen UI), `3000` (RAG API), `3001` (RAG MCP), `11434` (Ollama API). The full procedure (WSL mirrored networking, Ollama bind change, single firewall rule, security trade-offs) is in **[design.md §9](design.md)**.
+
+### Remote access (Tailscale, optional)
+
+To give a **single off-LAN agent** access to the RAG MCP endpoint — without a router port-forward and without general LAN access — run Tailscale inside the WSL distro and pin the remote user to port `3001` with a Tailscale ACL. It coexists with the LAN firewall rule and the operator's own router VPN. Full procedure (install, ACL, node-share, optional HTTPS) in **[design.md §9b](design.md)**.
 
 ## Acknowledged Limitation
 

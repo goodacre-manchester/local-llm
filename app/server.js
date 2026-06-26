@@ -976,7 +976,19 @@ async function expandQueries(question) {
  * ORIGINAL question → top-K. Falls back to single-query behaviour when
  * expansion yields nothing extra.
  */
-async function queryCollection(name, question, topK) {
+// Translate a simple section-header glob ("8.6.9.4.*", "*Hot-Plug*") to a
+// start-anchored case-insensitive RegExp. `*` → `.*`, `?` → `.`; other regex
+// metachars are escaped. Anchoring at the start prevents "8.6.9.4.*" from
+// accidentally matching "18.6.9.4.x". Returns null for empty/null input.
+function sectionGlobToRegex(glob) {
+  if (!glob) return null;
+  const escaped = String(glob).replace(/[.+^${}()|[\]\\]/g, "\\$&");
+  const re = escaped.replace(/\*/g, ".*").replace(/\?/g, ".");
+  return new RegExp("^" + re, "i");
+}
+
+async function queryCollection(name, question, topK, { sectionFilter = null } = {}) {
+  const sectionRe = sectionGlobToRegex(sectionFilter);
   const queries = await expandQueries(question);
   const union = new Map(); // id → candidate (best rrf seen)
   for (const q of queries) {
@@ -985,7 +997,10 @@ async function queryCollection(name, question, topK) {
       if (!prev || (c.rrf || 0) > (prev.rrf || 0)) union.set(c.id, c);
     }
   }
-  const merged = [...union.values()].sort((a, b) => (b.rrf || 0) - (a.rrf || 0));
+  let merged = [...union.values()].sort((a, b) => (b.rrf || 0) - (a.rrf || 0));
+  if (sectionRe) {
+    merged = merged.filter((c) => sectionRe.test(String(c.metadata?.section || "")));
+  }
   const reranked = await rerankItems(question, merged.slice(0, RERANK_CANDIDATES), name);
   return reranked
     .slice(0, topK)
@@ -1302,6 +1317,10 @@ app.post("/query", async (req, res) => {
   const query = String(req.body?.query || "").trim();
   const topK = Number(req.body?.topK || TOP_K_RESULTS);
   const requestedCollection = req.body?.collection ? String(req.body.collection).trim() : null;
+  // Optional section-header glob (e.g. "8.6.9.4.*", "*Hot-Plug*"). Accept both
+  // sectionFilter (camelCase) and section_filter (snake_case) — the MCP HTTP
+  // bridge speaks snake_case in its tool schema, this surface speaks camelCase.
+  const sectionFilter = req.body?.sectionFilter || req.body?.section_filter || null;
 
   if (!query) {
     res.status(400).json({ ok: false, error: "query is required" });
@@ -1314,8 +1333,8 @@ app.post("/query", async (req, res) => {
       res.status(400).json({ ok: false, error: "No active collection. Run POST /collections/:name/ingest first." });
       return;
     }
-    const matches = await queryCollection(name, query, topK);
-    res.json({ ok: true, query, collection: name, matches, topK });
+    const matches = await queryCollection(name, query, topK, { sectionFilter });
+    res.json({ ok: true, query, collection: name, matches, topK, sectionFilter: sectionFilter || undefined });
   } catch (err) {
     res.status(500).json({ ok: false, error: String(err) });
   }

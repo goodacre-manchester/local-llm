@@ -615,7 +615,9 @@ The rag-server is wrapped by two MCP servers — one per consumer pattern. Both 
 
 - **Transport:** Streamable HTTP (`POST /mcp` + SSE) at `http://<host>:3001/mcp`, plus `GET /health` for liveness probes.
 - **Mode:** stateless — every request builds a fresh `(Server, StreamableHTTPServerTransport)` pair, so cross-request state can't leak and the server survives both client-side reconnects and headless clients that never call `initialize`.
-- **Tools:** **single** — `rag_search(collection, query, top_k=8)`. Proxies `POST /query`, returns each chunk as `{text, score, fileName, section, page, file_path?, github_url?}`. Caller synthesises its own answer.
+- **Tools:** **single** — `rag_search(collection, query, top_k=12, section_filter?)`. Proxies `POST /query`, returns each chunk as `{text, score, fileName, section, page, file_path?, github_url?}`. Caller synthesises its own answer.
+  - `section_filter` is an optional glob over the chunk's `section` metadata (`*` and `?` wildcards, start-anchored, case-insensitive) applied after retrieval and before rerank. Use on the **second pass of a two-pass retrieval** — the first pass surfaces relevant subclause numbers / source paths, the second re-queries with `section_filter` (e.g. `"8.6.9.4.*"`, `"*Hot-Plug*"`, `"drivers/pci/hotplug/*"`) to pull verbatim chunks from a known structural location. This collapses what would otherwise be a Claude-side filter step into one rag-server call.
+  - Default `top_k` is **12** (not 8 as on the stdio variant); external agents typically synthesise across a wider chunk pool than the rag-server's own grounded answer needs.
 - **Dynamic catalogue:** the tool's `collection` parameter ships its `enum` rebuilt from `/v1/models` on each `tools/list` request (cached for 30 s). New collections appear automatically; no compose recreate, no code change.
 - **Compose service:** `rag-mcp` (node:20-slim, `network_mode: host`, depends_on rag-server). `npm install` runs in-place against the bind-mounted `scripts/rag-mcp/`; subsequent boots are near-instant.
 - **Auth:** optional bearer token via `MCP_AUTH_TOKEN` env (sourced from project-root `.env`). Clients must send `Authorization: Bearer <token>` on `/mcp`. `/health` is always open.
@@ -635,6 +637,97 @@ The rag-server is wrapped by two MCP servers — one per consumer pattern. Both 
   }
 }
 ```
+
+## 9b. Remote Access via Tailscale (Optional)
+
+The LAN exposure in §9 stops at the local subnet. To let a **specific off-LAN agent** reach the RAG stack — without a router port-forward and without granting general LAN access — run Tailscale inside the WSL distro and scope the remote user to the `rag-mcp` port only.
+
+This is independent of the router's OpenVPN (the operator's own full-LAN path) and of the §9 LAN firewall rules. All three coexist:
+
+| Door | Who | Reaches |
+|---|---|---|
+| LAN firewall rule (§9) | devices on `192.168.0.0/24` | all five LAN ports |
+| Router OpenVPN | operator | full LAN (incl. RDP) |
+| Tailscale + ACL | one shared remote user | `rag-mcp` (`:3001`) only |
+
+### 9b.1 Why Tailscale-in-WSL (not on Windows)
+
+The services live inside the Ubuntu distro. Running `tailscaled` in the same network namespace lets it reach `127.0.0.1:3001` directly — no cross-boundary forwarding puzzle. The node appears as a separate tailnet machine; the Windows host stays off the tailnet and keeps using localhost / LAN as before. Adding Tailscale removes nothing: LAN access (§9) and the operator's OpenVPN→RDP path are untouched.
+
+### 9b.2 Install + enable (in WSL)
+
+```bash
+curl -fsSL https://tailscale.com/install.sh | sh
+sudo systemctl enable --now tailscaled
+```
+
+### 9b.3 ACL policy (admin console → Access Controls)
+
+Defining any ACL switches the tailnet to default-deny, so paste a **complete** policy. This keeps the operator's own devices fully connected and cages the remote user to `:3001`:
+
+```jsonc
+{
+  "tagOwners": { "tag:rag-mcp": ["autogroup:admin"] },
+  "acls": [
+    // Operator + own devices: unchanged full access
+    { "action": "accept", "src": ["autogroup:member"], "dst": ["*:*"] },
+    // Shared remote user: ONLY the MCP port on the rag host
+    { "action": "accept", "src": ["remote-user@example.com"], "dst": ["tag:rag-mcp:3001"] }
+  ]
+}
+```
+
+The remote user is a **shared/external** user, not a tailnet member, so the broad `autogroup:member` rule never applies to them — the second rule is their entire surface. No subnet routes are advertised, so there is no path from the remote user onto the LAN.
+
+### 9b.4 Bring the node up, tagged
+
+A tag gives the server a stable identity with no key-expiry logout, and matches the ACL. **No `--advertise-routes`** — that is what guarantees the node is not a path onto the LAN:
+
+```bash
+sudo tailscale up --advertise-tags=tag:rag-mcp --accept-routes=false
+```
+
+`tailscale up` prints a login URL; open it in a browser and authenticate as the tailnet owner. (Run §9b.3 first — advertising an un-owned tag is rejected.)
+
+### 9b.5 Share the one node
+
+Admin console → Machines → this node → **Share** → enter the remote user's email (the same identity used in the ACL `src`). They accept and sign in with a free Tailscale account. Because it is a node *share* (not a tailnet invite), they see this one machine and nothing else — a second layer over the ACL.
+
+### 9b.6 Client configuration (remote machine)
+
+Tailscale (WireGuard) encrypts the tunnel, so plain HTTP over it is fine and the bearer token is omitted by design — the ACL + node-share are the access control:
+
+```json
+{
+  "mcpServers": {
+    "local-rag": {
+      "type": "http",
+      "url": "http://<node-tailscale-ip>:3001/mcp"
+    }
+  }
+}
+```
+
+### 9b.7 Optional HTTPS + stable name
+
+If the remote client requires `https://` (e.g. Claude Desktop) or a hostname is preferred, enable MagicDNS + HTTPS in the admin console, then:
+
+```bash
+sudo tailscale serve --bg 3001   # https://<node>.<tailnet>.ts.net/ -> localhost:3001
+tailscale serve status           # prints the exact URL
+```
+
+Change the ACL `dst` to `tag:rag-mcp:443` and the client URL to `https://<node>.<tailnet>.ts.net/mcp`.
+
+### 9b.8 Revoke
+
+Any one of: un-share the node, delete the `src` line from the ACL, or `sudo tailscale logout` on the node. Each cuts the remote user immediately.
+
+### 9b.9 Security notes
+
+- The ACL `src` is the **entire** boundary (no app-layer token, by choice) — get the email exact.
+- `:3001` is unauthenticated on the LAN too (§9.5); consistent with the other LAN services — the LAN is treated as trusted.
+- The node depends on the WSL distro being up. `vmIdleTimeout=-1` (already set in `.wslconfig`) prevents idle-shutdown; the autostart launcher (§6.9) keeps the distro and stack running across logons.
 
 ## 10. Operational Reference
 

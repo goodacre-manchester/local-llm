@@ -79,9 +79,32 @@ const server = new Server(
     capabilities: { tools: {} },
     instructions:
       "Local RAG retrieval over HTTP. Call rag_search(collection, query) " +
-      "to retrieve the top-K most-relevant chunks (text + section + page + " +
-      "score + optional GitHub URL for source-tree collections) from a named " +
-      "collection. The host application synthesises the final answer.",
+      "to retrieve top-K chunks (text + section + page + score + optional " +
+      "github_url for source-tree collections) from a named collection. " +
+      "The host application synthesises the final answer.\n\n" +
+      "Query patterns:\n" +
+      "- Two-pass: broad first to map the territory, then narrow with " +
+      "section_filter (a glob over the chunk's section header, e.g. " +
+      "\"8.6.9.4.*\" or \"*Hot-Plug*\") to grab verbatim subclause chunks.\n" +
+      "- Drill in on named artifacts: if a chunk names a state machine, " +
+      "parameter, subclause, or data set you don't already recognize, run " +
+      "a follow-up rag_search with that exact name before concluding the " +
+      "standard doesn't define a related concept.\n" +
+      "- Specs have edition lineage: the IEEE collection includes both " +
+      "base specs and amendments (e.g. 802.1AS-2025 absorbs 802.1ASdm-2024); " +
+      "a feature added by an amendment is normative in the rolled-in " +
+      "edition. Search both lineages.\n\n" +
+      "Epistemic stance: positive claims should cite a retrieved chunk " +
+      "verbatim. Treat \"the standard does not define X\" as a strong " +
+      "claim that requires an exhausted, name-specific search — and " +
+      "prefer phrasing it as \"did not retrieve\" rather than \"does not " +
+      "exist.\"\n\n" +
+      "Collections cover: AMD/Xilinx UG/PG docs (amd); IEEE 802.x + " +
+      "selected RFCs (ieee); Linux kernel subsystems (linux-bt/core/cxl/" +
+      "fs/mm/net/pci/usb); nginx source; PCIe/CXL/USB/HID/BT base specs " +
+      "(seccom). A question may benefit from multiple collections — e.g. " +
+      "a Linux PCI question often pairs linux-pci (kernel) with seccom " +
+      "(spec).",
   }
 );
 
@@ -122,10 +145,22 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             top_k: {
               type: "number",
               description:
-                "Number of chunks to return (default 8, max 40).",
+                "Number of chunks to return (default 12, max 40).",
               minimum: 1,
               maximum: 40,
-              default: 8,
+              default: 12,
+            },
+            section_filter: {
+              type: "string",
+              description:
+                "Optional glob over the chunk's `section` metadata, applied " +
+                "after retrieval and before rerank. Use when you already know " +
+                "the structural location to focus on, e.g. \"8.6.9.4.*\" for " +
+                "an IEEE 802.1Q subclause family, \"*Hot-Plug*\" for any " +
+                "section whose header contains that token, or " +
+                "\"drivers/pci/hotplug/*\" for a source-tree subtree. " +
+                "Wildcards: `*` matches any run of characters, `?` matches " +
+                "one. Match is start-anchored and case-insensitive.",
             },
           },
           required: ["collection", "query"],
@@ -146,7 +181,10 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
 
   const collection = args?.collection;
   const query = args?.query;
-  const topK = Math.max(1, Math.min(Number(args?.top_k ?? 8), 40));
+  const topK = Math.max(1, Math.min(Number(args?.top_k ?? 12), 40));
+  const sectionFilter = args?.section_filter
+    ? String(args.section_filter)
+    : null;
   if (!collection || !query) {
     return {
       content: [
@@ -180,7 +218,12 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
   const r = await fetch(`${RAG_BASE}/query`, {
     method: "POST",
     headers: ragHeaders({ "Content-Type": "application/json" }),
-    body: JSON.stringify({ query, collection, topK }),
+    body: JSON.stringify({
+      query,
+      collection,
+      topK,
+      ...(sectionFilter ? { sectionFilter } : {}),
+    }),
   });
   if (!r.ok) {
     const err = await r.text();
@@ -207,7 +250,13 @@ server.setRequestHandler(CallToolRequestSchema, async (req) => {
       github_url: meta.github_url,
     };
   });
-  const payload = { collection, query, top_k: topK, matches };
+  const payload = {
+    collection,
+    query,
+    top_k: topK,
+    ...(sectionFilter ? { section_filter: sectionFilter } : {}),
+    matches,
+  };
   return {
     content: [{ type: "text", text: JSON.stringify(payload, null, 2) }],
     structuredContent: payload,

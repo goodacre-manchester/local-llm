@@ -53,3 +53,5 @@ Thumbs.db
 # Claude Code per-machine settings (permissions, hooks, env). Project-shared
 # settings (if any) go in .claude/settings.json which IS committed.
 .claude/settings.local.json
+# Machine-local runtime locks (scheduled-tasks lock holds a live PID/session)
+.claude/*.lock

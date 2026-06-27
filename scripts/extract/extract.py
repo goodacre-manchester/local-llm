@@ -166,6 +166,16 @@ def _build_toc(pdf: Path):
         entries.append((page, title, path))
     if not entries:
         return None, None
+    # Degenerate-outline guard: some PDFs ship only a title-page bookmark (or a
+    # couple of cover-matter entries) with no real clause tree — e.g. the CXL
+    # 4.0 eval copy carries one L1 title bookmark for all 1276 pages. Applying
+    # that as `section` collapses the whole document to one flat heading and
+    # wipes the backend's heuristic clause headings. If the outline yields fewer
+    # than 3 distinct section anchors it is not usable for sectioning; treat the
+    # PDF as un-bookmarked so the heuristic headings survive. (Remediate an
+    # already-extracted sidecar with resection-from-headings.py.)
+    if len({leaf for _, leaf, _ in entries}) < 3:
+        return None, None
     entries.sort(key=lambda e: e[0])
     start_pages = [e[0] for e in entries]
 
